@@ -2,80 +2,73 @@
 
 # ============================================================
 # 06. SSH SERVER CONFIGURATION
+# Rocky Linux / RHEL
 # ============================================================
 
+# Check root privileges
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Please run this script as root."
+    exit 1
+fi
+
 # Install OpenSSH Server
-dnf install openssh-server -y
+dnf install openssh-server -y || exit 1
 
-# Backup SSH configuration before making changes
-cp -p /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
-
-# Edit SSH configuration file
-# vim /etc/ssh/sshd_config
-
-# Add/update the following settings in sshd_config:
-#
-# ListenAddress 192.168.0.254
-# LoginGraceTime 1m
-# PermitRootLogin yes
-# MaxAuthTries 2
-
-# Automatically configure SSH server settings without opening vim
-
+# SSH configuration file
 SSHD_CONFIG="/etc/ssh/sshd_config"
 
-# Backup configuration
-cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.bak"
+# Create a backup before making changes
+cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.bak" || exit 1
 
-# Update existing settings or add them if missing
-for setting in \
-    "ListenAddress 192.168.0.254" \
-    "LoginGraceTime 1m" \
-    "PermitRootLogin yes" \
-    "MaxAuthTries 2"
-do
-    key="${setting%% *}"
+# ============================================================
+# AUTOMATIC SSH SERVER CONFIGURATION
+# ============================================================
 
-    if grep -qE "^[[:space:]#]*${key}[[:space:]]+" "$SSHD_CONFIG"; then
-        sed -i -E "s|^[[:space:]#]*${key}[[:space:]]+.*|${setting}|" "$SSHD_CONFIG"
-    else
-        echo "$setting" >> "$SSHD_CONFIG"
-    fi
-done
+# Add/update SSH settings without opening vim
+set_ssh_setting() {
+    local key="$1"
+    local value="$2"
+
+    # Remove existing active or commented directives
+    sed -i -E \
+        "/^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+/d" \
+        "$SSHD_CONFIG"
+
+    # Add the required setting
+    echo "${key} ${value}" >> "$SSHD_CONFIG"
+}
+
+set_ssh_setting "ListenAddress" "192.168.0.254"
+set_ssh_setting "LoginGraceTime" "1m"
+set_ssh_setting "PermitRootLogin" "yes"
+set_ssh_setting "MaxAuthTries" "2"
 
 # Validate SSH configuration
 if sshd -t; then
     echo "SSH configuration updated successfully."
 else
-    echo "SSH configuration is invalid. Restoring backup."
+    echo "Invalid SSH configuration. Restoring backup."
     cp -p "${SSHD_CONFIG}.bak" "$SSHD_CONFIG"
     exit 1
 fi
 
-
-
-# Validate SSH configuration
-sshd -t || exit 1
-
 # Restart and enable SSH service
-systemctl restart sshd
-systemctl enable --now sshd
+systemctl enable --now sshd || exit 1
+systemctl restart sshd || exit 1
 
 # Check SSH service status
 systemctl status sshd --no-pager
 
-# Configure firewall for SSH
+# Configure firewall for default SSH
 firewall-cmd --permanent --add-service=ssh
 firewall-cmd --reload
 firewall-cmd --list-all
 
-# Connect to SSH server
-ssh root@192.168.0.254
-
-# List home directories
+# Display home directories
 ls /home/
 
-exit
+# Optional connection test:
+# ssh root@192.168.0.254
 
 
 # ============================================================
@@ -88,35 +81,43 @@ read -r -p "Do you want to configure passwordless authentication? (yes/no): " pa
 
 if [[ "$passwordless" == "yes" || "$passwordless" == "y" ]]; then
 
-    # Generate SSH key
-    # ssh-keygen -t rsa
-    # Press Enter
-    # Press Enter
-    # Press Enter
-
     # Generate SSH key without interactive prompts
     if [[ ! -f /root/.ssh/id_rsa ]]; then
         mkdir -p /root/.ssh
         chmod 700 /root/.ssh
 
         ssh-keygen -t rsa -N "" -f /root/.ssh/id_rsa -q
-        echo "SSH key generated successfully."
+
+        if [[ $? -eq 0 ]]; then
+            echo "SSH key generated successfully."
+        else
+            echo "SSH key generation failed."
+            exit 1
+        fi
     else
         echo "SSH key already exists. Skipping key generation."
     fi
-
-    # Copy public key to the remote server
-    ssh-copy-id -i /root/.ssh/id_rsa.pub root@192.168.0.1
-
-    # Test passwordless authentication
-    ssh root@192.168.0.1
-
-    exit
 
     # Set correct SSH directory and key permissions
     chmod 700 /root/.ssh
     chmod 600 /root/.ssh/id_rsa
     chmod 644 /root/.ssh/id_rsa.pub
+
+    # Copy public key to the remote server
+    ssh-copy-id -i /root/.ssh/id_rsa.pub root@192.168.0.1
+
+    if [[ $? -eq 0 ]]; then
+        echo "Public key copied successfully."
+
+        # Test passwordless authentication without opening a shell
+        if ssh -o BatchMode=yes root@192.168.0.1 "true"; then
+            echo "Passwordless SSH authentication is working."
+        else
+            echo "Passwordless authentication test failed."
+        fi
+    else
+        echo "Failed to copy the public key."
+    fi
 
 else
     echo "Skipping passwordless authentication configuration."
@@ -126,15 +127,18 @@ fi
 # ============================================================
 # CHANGE SSH PORT
 # If the user wants to change the SSH port,
-# execute this block and ask which port to use.
+# ask which port to use.
 # ============================================================
 
 read -r -p "Do you want to change the SSH port? (yes/no): " change_port
 
 if [[ "$change_port" == "yes" || "$change_port" == "y" ]]; then
 
-    # Display current SSH listening port
-    netstat -tunlp | grep sshd
+    # Install required packages
+    dnf install policycoreutils-python-utils net-tools -y || exit 1
+
+    # Display current SSH listening ports
+    netstat -tunlp | grep sshd || true
 
     # Ask user for the new SSH port
     read -r -p "Enter the new SSH port (example: 6006): " SSH_PORT
@@ -142,36 +146,61 @@ if [[ "$change_port" == "yes" || "$change_port" == "y" ]]; then
     # Validate port number
     if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] ||
        (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
-        echo "Invalid port number. Please use a port between 1 and 65535."
+        echo "Invalid port number. Use a port between 1 and 65535."
         exit 1
     fi
 
-    # Install required packages
-    dnf install policycoreutils-python-utils -y
-    dnf install net-tools -y
+    # Prevent changing to the existing default SSH port
+    if [[ "$SSH_PORT" == "22" ]]; then
+        echo "Port 22 is already the default SSH port."
+        echo "Choose another port if you want to change it."
+        exit 1
+    fi
 
-    # Edit SSH configuration file
-    # vim /etc/ssh/sshd_config
+    # Back up the current configuration
+    cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.bak" || exit 1
 
-    # Add/update the following setting in sshd_config:
-    #
-    # Port 6006
-    #
-    # Replace 6006 with the port entered by the user.
-    # Make sure there is only one active Port setting.
+    # Check whether the requested port is already assigned
+    # to an SELinux port type
+    if semanage port -l | awk -v p="$SSH_PORT" '
+        $2 == "tcp" {
+            n = split($3, ports, ",")
+            for (i = 1; i <= n; i++) {
+                if (ports[i] == p) found = 1
+            }
+        }
+        END { exit !found }
+    '; then
+
+        # Check whether it is already an SSH port
+        if semanage port -l | awk -v p="$SSH_PORT" '
+            $1 == "ssh_port_t" && $2 == "tcp" {
+                n = split($3, ports, ",")
+                for (i = 1; i <= n; i++) {
+                    if (ports[i] == p) found = 1
+                }
+            }
+            END { exit !found }
+        '; then
+            echo "Port $SSH_PORT is already allowed for SSH in SELinux."
+        else
+            echo "Port $SSH_PORT is assigned to another SELinux port type."
+            echo "Choose a different port or review SELinux configuration."
+            exit 1
+        fi
+
+    else
+        # Add the new port to the SSH SELinux port type
+        semanage port -a -t ssh_port_t -p tcp "$SSH_PORT" || exit 1
+    fi
 
     # Automatically update SSH port in sshd_config
-    SSHD_CONFIG="/etc/ssh/sshd_config"
+    # Remove all active Port directives and add the requested port
+    sed -i -E \
+        '/^[[:space:]]*Port[[:space:]]+/d' \
+        "$SSHD_CONFIG"
 
-    # Create a backup
-    cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.bak"
-
-    # Update the existing Port setting or add it if missing
-    if grep -qE '^[[:space:]]*Port[[:space:]]+' "$SSHD_CONFIG"; then
-        sed -i -E "s/^[[:space:]]*Port[[:space:]]+.*/Port ${SSH_PORT}/" "$SSHD_CONFIG"
-    else
-        echo "Port ${SSH_PORT}" >> "$SSHD_CONFIG"
-    fi
+    echo "Port ${SSH_PORT}" >> "$SSHD_CONFIG"
 
     # Validate configuration and restore backup on failure
     if sshd -t; then
@@ -182,47 +211,46 @@ if [[ "$change_port" == "yes" || "$change_port" == "y" ]]; then
         exit 1
     fi
 
-    # Validate SSH configuration
-    sshd -t || exit 1
-
-    # Configure SELinux for the new SSH port
-    if semanage port -l | grep -q "^ssh_port_t.*\b${SSH_PORT}\b"; then
-        echo "Port $SSH_PORT is already configured for SSH in SELinux."
-    elif semanage port -l | grep -qE "^[^[:space:]]+[[:space:]]+tcp[[:space:]]+.*(^|,|[[:space:]])${SSH_PORT}([,[:space:]]|$)"; then
-        echo "Port $SSH_PORT is already assigned to another SELinux port type."
-        echo "Choose a different port or review the existing SELinux configuration."
-        exit 1
-    else
-        semanage port -a -t ssh_port_t -p tcp "$SSH_PORT"
-    fi
-
     # Display SSH SELinux port configuration
     semanage port -l | grep ssh_port_t
 
     # Configure firewall for the new SSH port
-    firewall-cmd --permanent --add-port="${SSH_PORT}/tcp"
-    firewall-cmd --reload
+    firewall-cmd --permanent --add-port="${SSH_PORT}/tcp" || exit 1
+    firewall-cmd --reload || exit 1
     firewall-cmd --list-all
 
-    # Restart and enable SSH service
-    systemctl restart sshd
+    # Restart SSH service
+    systemctl restart sshd || {
+        echo "SSH restart failed. Restoring previous configuration."
+        cp -p "${SSHD_CONFIG}.bak" "$SSHD_CONFIG"
+        systemctl restart sshd
+        exit 1
+    }
+
     systemctl enable sshd
 
     # Check SSH service status
     systemctl status sshd --no-pager
 
     # Display SSH listening ports
-    netstat -tunlp | grep sshd
+    netstat -tunlp | grep sshd || true
 
-    # Test connection using the new SSH port
-    ssh root@192.168.0.254 -p "$SSH_PORT"
-
-    exit
+    # Test the new port without opening an interactive shell
+    echo "Testing SSH connection on port ${SSH_PORT}..."
+    ssh -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -p "$SSH_PORT" \
+        root@192.168.0.254 "true" \
+        && echo "SSH connection test succeeded." \
+        || echo "Connection test failed. Verify network access and authentication."
 
 else
     echo "Keeping the default SSH port configuration."
 fi
 
+
 # ============================================================
 # END OF SSH SERVER CONFIGURATION
 # ============================================================
+
+echo "SSH server configuration script completed."
