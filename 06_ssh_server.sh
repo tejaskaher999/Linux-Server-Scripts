@@ -11,7 +11,7 @@ dnf install openssh-server -y
 cp -p /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
 
 # Edit SSH configuration file
-vim /etc/ssh/sshd_config
+# vim /etc/ssh/sshd_config
 
 # Add/update the following settings in sshd_config:
 #
@@ -19,6 +19,40 @@ vim /etc/ssh/sshd_config
 # LoginGraceTime 1m
 # PermitRootLogin yes
 # MaxAuthTries 2
+
+# Automatically configure SSH server settings without opening vim
+
+SSHD_CONFIG="/etc/ssh/sshd_config"
+
+# Backup configuration
+cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.bak"
+
+# Update existing settings or add them if missing
+for setting in \
+    "ListenAddress 192.168.0.254" \
+    "LoginGraceTime 1m" \
+    "PermitRootLogin yes" \
+    "MaxAuthTries 2"
+do
+    key="${setting%% *}"
+
+    if grep -qE "^[[:space:]#]*${key}[[:space:]]+" "$SSHD_CONFIG"; then
+        sed -i -E "s|^[[:space:]#]*${key}[[:space:]]+.*|${setting}|" "$SSHD_CONFIG"
+    else
+        echo "$setting" >> "$SSHD_CONFIG"
+    fi
+done
+
+# Validate SSH configuration
+if sshd -t; then
+    echo "SSH configuration updated successfully."
+else
+    echo "SSH configuration is invalid. Restoring backup."
+    cp -p "${SSHD_CONFIG}.bak" "$SSHD_CONFIG"
+    exit 1
+fi
+
+
 
 # Validate SSH configuration
 sshd -t || exit 1
@@ -55,10 +89,21 @@ read -r -p "Do you want to configure passwordless authentication? (yes/no): " pa
 if [[ "$passwordless" == "yes" || "$passwordless" == "y" ]]; then
 
     # Generate SSH key
-    ssh-keygen -t rsa
+    # ssh-keygen -t rsa
     # Press Enter
     # Press Enter
     # Press Enter
+
+    # Generate SSH key without interactive prompts
+    if [[ ! -f /root/.ssh/id_rsa ]]; then
+        mkdir -p /root/.ssh
+        chmod 700 /root/.ssh
+
+        ssh-keygen -t rsa -N "" -f /root/.ssh/id_rsa -q
+        echo "SSH key generated successfully."
+    else
+        echo "SSH key already exists. Skipping key generation."
+    fi
 
     # Copy public key to the remote server
     ssh-copy-id -i /root/.ssh/id_rsa.pub root@192.168.0.1
@@ -106,7 +151,7 @@ if [[ "$change_port" == "yes" || "$change_port" == "y" ]]; then
     dnf install net-tools -y
 
     # Edit SSH configuration file
-    vim /etc/ssh/sshd_config
+    # vim /etc/ssh/sshd_config
 
     # Add/update the following setting in sshd_config:
     #
@@ -114,6 +159,28 @@ if [[ "$change_port" == "yes" || "$change_port" == "y" ]]; then
     #
     # Replace 6006 with the port entered by the user.
     # Make sure there is only one active Port setting.
+
+    # Automatically update SSH port in sshd_config
+    SSHD_CONFIG="/etc/ssh/sshd_config"
+
+    # Create a backup
+    cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.bak"
+
+    # Update the existing Port setting or add it if missing
+    if grep -qE '^[[:space:]]*Port[[:space:]]+' "$SSHD_CONFIG"; then
+        sed -i -E "s/^[[:space:]]*Port[[:space:]]+.*/Port ${SSH_PORT}/" "$SSHD_CONFIG"
+    else
+        echo "Port ${SSH_PORT}" >> "$SSHD_CONFIG"
+    fi
+
+    # Validate configuration and restore backup on failure
+    if sshd -t; then
+        echo "SSH port configured to ${SSH_PORT}."
+    else
+        echo "Invalid SSH configuration. Restoring backup."
+        cp -p "${SSHD_CONFIG}.bak" "$SSHD_CONFIG"
+        exit 1
+    fi
 
     # Validate SSH configuration
     sshd -t || exit 1
