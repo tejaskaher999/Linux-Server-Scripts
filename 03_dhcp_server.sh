@@ -1,73 +1,39 @@
 #!/bin/bash
 # ============================================================
 # Script Name : 03_dhcp_server.sh
-# Purpose     : Configure DHCP Server automatically
+# Purpose     : Automatically detect, install and configure
+#               ISC DHCP or Kea DHCP on Rocky Linux.
 #
-# Supported DHCP implementations:
-#   1. ISC DHCP Server (dhcp-server)
-#   2. Kea DHCP Server
+# Features:
+#   1. Automatically detect interface and IPv4 settings.
+#   2. Allow detected configuration values to be edited.
+#   3. Check ISC DHCP and Kea package availability.
+#   4. Offer Kea when ISC DHCP is unavailable.
+#   5. Generate and validate the selected server config.
+#   6. Back up the existing configuration.
+#   7. Configure firewall and start the selected service.
 #
-# Automatic network detection:
-#   - Network interface
-#   - Server IPv4 address
-#   - Network
-#   - Netmask
-#
-# Automatic DHCP settings:
-#   - Gateway/DNS : <network>.254
-#   - DHCP Start  : <network>.10
-#   - DHCP End    : <network>.100
-#
-# Example:
-#
-#   Server IP : 192.168.78.128
-#   Network   : 192.168.78.0/24
-#   Gateway   : 192.168.78.254
-#   DHCP Pool : 192.168.78.10 - 192.168.78.100
-#
-# Rocky Linux 10:
-#   ISC DHCP may not be available.
-#   In that case the script offers Kea DHCP.
+# No terminal screen clearing is performed.
 # ============================================================
 
 set -Eeuo pipefail
 
-# ============================================================
-# ROOT CHECK
-# ============================================================
+# -------------------- ROOT CHECK -----------------------------
 
 if [[ "$EUID" -ne 0 ]]; then
-    echo
-    echo "ERROR: This script must be run as root."
-    echo
-    echo "Example:"
-    echo "  sudo ./03_dhcp_server.sh"
-    echo
+    echo "ERROR: Run this script as root."
+    echo "Example: sudo ./03_dhcp_server.sh"
     exit 1
 fi
 
+# -------------------- REQUIRED COMMANDS ----------------------
 
-# ============================================================
-# REQUIRED COMMAND CHECK
-# ============================================================
-
-for cmd in ip python3 dnf systemctl rpm; do
-
+for cmd in ip python3 dnf rpm systemctl; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo
-        echo "ERROR: Required command '$cmd' is not installed."
-        echo
+        echo "ERROR: Required command '$cmd' is missing."
         exit 1
     fi
-
 done
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-clear 2>/dev/null || true
 
 echo
 echo "============================================================"
@@ -75,20 +41,13 @@ echo "          AUTOMATIC DHCP SERVER CONFIGURATION"
 echo "============================================================"
 echo
 
-
-# ============================================================
-# DETECT NETWORK INTERFACE
-# ============================================================
+# -------------------- DETECT NETWORK INTERFACE ---------------
 
 echo "Detecting network interface..."
 
-# First preference:
-# Interface used by the default IPv4 route.
-
 INTERFACE="$(
     ip -4 route show default |
-    awk '
-    NR == 1 {
+    awk 'NR == 1 {
         for (i = 1; i <= NF; i++) {
             if ($i == "dev") {
                 print $(i + 1)
@@ -98,73 +57,34 @@ INTERFACE="$(
     }'
 )"
 
-
-# If default route is not available,
-# find the first global IPv4 interface.
-
+# Fallback: find the first global IPv4 interface.
 if [[ -z "$INTERFACE" ]]; then
-
     INTERFACE="$(
         ip -o -4 addr show scope global |
-        awk '
-        $2 !~ /^(docker|br-|veth)/ {
+        awk '$2 !~ /^(docker|br-|veth)/ {
             print $2
             exit
         }'
     )"
-
 fi
-
 
 if [[ -z "$INTERFACE" ]]; then
-
-    echo
-    echo "ERROR: Could not detect a suitable network interface."
-    echo
-    echo "Run:"
-    echo "  ip -4 addr"
-    echo
+    echo "ERROR: No suitable network interface was detected."
     exit 1
-
 fi
 
-
-# ============================================================
-# DETECT SERVER IP + PREFIX
-# ============================================================
-
+# Detect the current IPv4 address and CIDR prefix.
 IP_CIDR="$(
     ip -o -4 addr show dev "$INTERFACE" scope global |
     awk 'NR == 1 {print $4}'
 )"
 
-
 if [[ -z "$IP_CIDR" ]]; then
-
-    echo
-    echo "ERROR: No global IPv4 address found on:"
-    echo "  $INTERFACE"
-    echo
+    echo "ERROR: No global IPv4 address found on $INTERFACE."
     exit 1
-
 fi
 
-
-# ============================================================
-# CALCULATE NETWORK INFORMATION
-# ============================================================
-
-#
-# This script intentionally requires /24.
-#
-# Reason:
-#
-#   Gateway    = .254
-#   DHCP Start = .10
-#   DHCP End   = .100
-#
-# These values are based on the requested /24 layout.
-#
+# -------------------- AUTOMATIC NETWORK CALCULATION ----------
 
 if ! NETWORK_INFO="$(
     python3 - "$IP_CIDR" <<'PY'
@@ -172,456 +92,457 @@ import ipaddress
 import sys
 
 try:
-
     interface = ipaddress.IPv4Interface(sys.argv[1])
-
     network = interface.network
-
-    if interface.ip.is_loopback:
-        raise ValueError("Loopback address cannot be used.")
-
-    if interface.ip.is_link_local:
-        raise ValueError("Link-local address cannot be used.")
-
-    # This script expects /24.
-    if network.prefixlen != 24:
-
-        raise ValueError(
-            f"Detected subnet is /{network.prefixlen}. "
-            "This script requires a /24 network because "
-            "the DHCP pool uses .10 - .100 and gateway .254."
-        )
-
     server = interface.ip
 
-    gateway = network.network_address + 254
+    if server.is_loopback or server.is_link_local:
+        raise ValueError("Detected IP is not suitable for DHCP.")
 
-    range_start = network.network_address + 10
-
-    range_end = network.network_address + 100
-
-    # Server must not be inside DHCP pool.
-
-    if range_start <= server <= range_end:
-
+    if network.prefixlen != 24:
         raise ValueError(
-            f"Server IP {server} is inside the DHCP pool "
-            f"{range_start} - {range_end}. "
-            "Move the server to a static IP outside the DHCP pool."
+            f"Detected subnet is /{network.prefixlen}, not /24. "
+            "This script uses the requested .10-.100 pool "
+            "and .254 gateway convention for /24 networks."
         )
 
-    # Server must not be gateway.
+    gateway = network.network_address + 254
+    start = network.network_address + 10
+    end = network.network_address + 100
+
+    if start <= server <= end:
+        raise ValueError(
+            f"Server IP {server} is inside the proposed DHCP pool "
+            f"{start}-{end}. Use a static server IP outside the pool."
+        )
 
     if server == gateway:
-
-        raise ValueError(
-            f"Server IP {server} conflicts with gateway {gateway}."
-        )
+        raise ValueError("Server IP conflicts with the gateway.")
 
     print(
-        str(server),
-        str(network),
-        str(network.netmask),
-        str(gateway),
-        str(range_start),
-        str(range_end)
+        server,
+        network,
+        network.netmask,
+        gateway,
+        start,
+        end
     )
 
 except Exception as exc:
-
     print(f"ERROR: {exc}", file=sys.stderr)
-
     sys.exit(1)
-
 PY
 )"; then
-
-    echo
-    echo "ERROR: Could not calculate network configuration."
-    echo
+    echo "ERROR: Could not calculate network settings."
     exit 1
+fi
+
+read -r SERVER_IP NETWORK NETMASK GATEWAY RANGE_START RANGE_END \
+    <<< "$NETWORK_INFO"
+
+DNS_SERVERS="$GATEWAY"
+DOMAIN_NAME="tejas.com"
+
+# Preserve the detected values for reference and validation.
+DETECTED_INTERFACE="$INTERFACE"
+DETECTED_SERVER_IP="$SERVER_IP"
+
+# -------------------- DISPLAY DETECTED VALUES ----------------
+
+show_settings() {
+    echo
+    echo "Network configuration:"
+    echo "------------------------------------------------------------"
+    echo "Interface       : $INTERFACE"
+    echo "Server IP       : $SERVER_IP"
+    echo "Network         : $NETWORK"
+    echo "Subnet Mask     : $NETMASK"
+    echo "Gateway         : $GATEWAY"
+    echo "DHCP Start      : $RANGE_START"
+    echo "DHCP End        : $RANGE_END"
+    echo "DNS Server      : $DNS_SERVERS"
+    echo "Domain Name     : $DOMAIN_NAME"
+    echo "------------------------------------------------------------"
+}
+
+show_settings
+
+# -------------------- EDIT DETECTED VALUES -------------------
+
+echo
+echo "You can keep the detected values or change them."
+echo "Press ENTER at any prompt to keep its current value."
+echo
+
+read -r -p "Edit configuration values? (y/N): " EDIT_VALUES
+
+if [[ "$EDIT_VALUES" =~ ^[Yy]$ ]]; then
+
+    read -r -p "Interface [$INTERFACE]: " INPUT_VALUE
+    INTERFACE="${INPUT_VALUE:-$INTERFACE}"
+
+    read -r -p "Server IP [$SERVER_IP]: " INPUT_VALUE
+    SERVER_IP="${INPUT_VALUE:-$SERVER_IP}"
+
+    read -r -p "Network CIDR [$NETWORK]: " INPUT_VALUE
+    NETWORK="${INPUT_VALUE:-$NETWORK}"
+
+    read -r -p "Subnet mask [$NETMASK]: " INPUT_VALUE
+    NETMASK="${INPUT_VALUE:-$NETMASK}"
+
+    read -r -p "Gateway [$GATEWAY]: " INPUT_VALUE
+    GATEWAY="${INPUT_VALUE:-$GATEWAY}"
+
+    read -r -p "DHCP range start [$RANGE_START]: " INPUT_VALUE
+    RANGE_START="${INPUT_VALUE:-$RANGE_START}"
+
+    read -r -p "DHCP range end [$RANGE_END]: " INPUT_VALUE
+    RANGE_END="${INPUT_VALUE:-$RANGE_END}"
+
+    read -r -p "DNS server(s), comma-separated [$DNS_SERVERS]: " INPUT_VALUE
+    DNS_SERVERS="${INPUT_VALUE:-$DNS_SERVERS}"
+
+    read -r -p "Domain name [$DOMAIN_NAME]: " INPUT_VALUE
+    DOMAIN_NAME="${INPUT_VALUE:-$DOMAIN_NAME}"
 
 fi
 
-
-read -r \
-    SERVER_IP \
-    NETWORK \
-    NETMASK \
-    GATEWAY \
-    RANGE_START \
-    RANGE_END <<< "$NETWORK_INFO"
-
-
-# ============================================================
-# AUTOMATIC DNS
-# ============================================================
-
-DNS_SERVERS="$GATEWAY"
-
-
-# ============================================================
-# DOMAIN NAME
-# ============================================================
-
-DOMAIN_NAME="tejas.com"
-
-
-# ============================================================
-# DISPLAY NETWORK CONFIGURATION
-# ============================================================
+# -------------------- VALIDATE EDITED VALUES ------------------
 
 echo
-echo "Detected network configuration:"
-echo "------------------------------------------------------------"
-echo "Interface       : $INTERFACE"
-echo "Server IP       : $SERVER_IP"
-echo "Network         : $NETWORK"
-echo "Subnet Mask     : $NETMASK"
-echo "Gateway         : $GATEWAY"
-echo "DHCP Start      : $RANGE_START"
-echo "DHCP End        : $RANGE_END"
-echo "DNS Server      : $DNS_SERVERS"
-echo "Domain Name     : $DOMAIN_NAME"
-echo "------------------------------------------------------------"
+echo "Validating network settings..."
+
+if ! python3 - \
+    "$INTERFACE" \
+    "$SERVER_IP" \
+    "$NETWORK" \
+    "$NETMASK" \
+    "$GATEWAY" \
+    "$RANGE_START" \
+    "$RANGE_END" \
+    "$DNS_SERVERS" \
+    "$DOMAIN_NAME" <<'PY'
+import ipaddress
+import re
+import subprocess
+import sys
+
+(
+    interface,
+    server_ip,
+    network_cidr,
+    netmask,
+    gateway,
+    range_start,
+    range_end,
+    dns_servers,
+    domain
+) = sys.argv[1:]
+
+try:
+    # Check that the selected interface exists.
+    subprocess.run(
+        ["ip", "link", "show", "dev", interface],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    server = ipaddress.IPv4Address(server_ip)
+    network = ipaddress.ip_network(network_cidr, strict=False)
+    mask = ipaddress.IPv4Address(netmask)
+    gw = ipaddress.IPv4Address(gateway)
+    start = ipaddress.IPv4Address(range_start)
+    end = ipaddress.IPv4Address(range_end)
+
+    if network.version != 4 or network.prefixlen != 24:
+        raise ValueError("Network must be an IPv4 /24 network.")
+
+    if str(network.netmask) != str(mask):
+        raise ValueError(
+            f"Subnet mask {mask} does not match network {network}."
+        )
+
+    if server not in network:
+        raise ValueError("Server IP must belong to the selected network.")
+
+    if gw not in network or gw in (network.network_address,
+                                    network.broadcast_address):
+        raise ValueError("Gateway must be a usable address in the network.")
+
+    if start not in network or end not in network:
+        raise ValueError("Both DHCP range addresses must be in the network.")
+
+    if start >= end:
+        raise ValueError("DHCP range start must be lower than its end.")
+
+    if start <= server <= end:
+        raise ValueError("Server IP must not fall inside the DHCP pool.")
+
+    if start <= gw <= end:
+        raise ValueError("Gateway must not fall inside the DHCP pool.")
+
+    if start == network.network_address or end == network.broadcast_address:
+        raise ValueError("DHCP pool cannot include network/broadcast address.")
+
+    # DNS accepts one or more IPv4 addresses separated by commas.
+    dns_list = [item.strip() for item in dns_servers.split(",")]
+
+    if not dns_list or any(not item for item in dns_list):
+        raise ValueError("Enter valid comma-separated DNS server addresses.")
+
+    for dns in dns_list:
+        ipaddress.IPv4Address(dns)
+
+    # Basic domain-name validation.
+    if not domain or len(domain) > 253:
+        raise ValueError("Domain name is empty or too long.")
+
+    if not re.fullmatch(
+        r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}"
+        r"[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}"
+        r"[A-Za-z0-9])?))*",
+        domain
+    ):
+        raise ValueError("Domain name format is invalid.")
+
+    # Server IP must already be configured on the selected interface.
+    actual_addresses = subprocess.check_output(
+        ["ip", "-o", "-4", "addr", "show", "dev", interface],
+        text=True
+    )
+
+    assigned_ips = []
+    for line in actual_addresses.splitlines():
+        fields = line.split()
+        if "inet" in fields:
+            assigned_ips.append(fields[fields.index("inet") + 1].split("/")[0])
+
+    if server_ip not in assigned_ips:
+        raise ValueError(
+            f"{server_ip} is not currently assigned to {interface}. "
+            "Configure that address on the machine first."
+        )
+
+    print("All network settings are valid.")
+
+except subprocess.CalledProcessError:
+    print(f"ERROR: Interface '{interface}' does not exist.", file=sys.stderr)
+    sys.exit(1)
+except Exception as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+then
+    echo
+    echo "ERROR: Correct the values and run the script again."
+    echo "No DHCP configuration has been changed."
+    exit 1
+fi
+
+show_settings
+
 echo
-
-
-# ============================================================
-# IMPORTANT WARNING
-# ============================================================
-
 echo "IMPORTANT:"
-echo "- Confirm that $GATEWAY is really your gateway."
-echo "- Confirm that $GATEWAY provides DNS service."
+echo "- Confirm that $GATEWAY is your actual gateway."
+echo "- Confirm that your DNS server address(es) provide DNS."
 echo "- Use a static IP or DHCP reservation for this server."
-echo "- Make sure another DHCP server is not already serving"
-echo "  this same LAN."
-echo "- Run this only on a network where you are authorized"
-echo "  to provide DHCP service."
+echo "- Ensure no other DHCP server conflicts with this pool."
+echo "- Run only on a network you are authorized to administer."
 echo
-
 
 read -r -p "Continue with this configuration? (y/N): " CONFIRM
 
-
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-
     echo
     echo "Cancelled. No DHCP configuration was changed."
-    echo
     exit 0
-
 fi
 
+# -------------------- PACKAGE AVAILABILITY -------------------
 
-# ============================================================
-# DETECT DHCP IMPLEMENTATIONS
-# ============================================================
-
-echo
-echo "============================================================"
-echo "          CHECKING DHCP SERVER AVAILABILITY"
-echo "============================================================"
-echo
-
-
-# ------------------------------------------------------------
-# Function: Check if a package is available in repositories
-# ------------------------------------------------------------
-
-package_available()
-{
+package_available() {
     local package="$1"
 
-    if dnf -q list --available "$package" >/dev/null 2>&1; then
+    if rpm -q "$package" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if dnf -q repoquery --available --qf '%{name}' "$package" \
+        2>/dev/null | grep -Fxq "$package"; then
+        return 0
+    fi
+
+    if dnf -q list --available "$package" 2>/dev/null |
+        awk -v wanted="$package" '
+            NR > 1 {
+                name = $1
+                sub(/\..*$/, "", name)
+                if (name == wanted) found = 1
+            }
+            END { exit !found }
+        '; then
         return 0
     fi
 
     return 1
 }
 
-
-# ============================================================
-# CHECK ISC DHCP
-# ============================================================
+echo
+echo "Checking DHCP packages in enabled repositories..."
+echo
 
 ISC_AVAILABLE=false
-
-if package_available "dhcp-server"; then
-    ISC_AVAILABLE=true
-fi
-
-
-# ============================================================
-# CHECK KEA DHCP
-# ============================================================
-
 KEA_AVAILABLE=false
 
-if package_available "kea"; then
-    KEA_AVAILABLE=true
-fi
-
-
-# Also consider already-installed packages.
-
-if rpm -q dhcp-server >/dev/null 2>&1; then
+if package_available dhcp-server; then
     ISC_AVAILABLE=true
+    echo "[AVAILABLE] ISC DHCP (dhcp-server)"
+else
+    echo "[NOT AVAILABLE] ISC DHCP (dhcp-server)"
 fi
 
-if rpm -q kea >/dev/null 2>&1; then
+if package_available kea; then
     KEA_AVAILABLE=true
+    echo "[AVAILABLE] Kea DHCP (kea)"
+else
+    echo "[NOT AVAILABLE] Kea DHCP (kea)"
 fi
 
-
-# ============================================================
-# DISPLAY AVAILABILITY
-# ============================================================
+# -------------------- SELECT DHCP IMPLEMENTATION -------------
 
 echo
-echo "DHCP Server Availability:"
-echo "------------------------------------------------------------"
 
-if [[ "$ISC_AVAILABLE" == true ]]; then
-    echo "ISC DHCP Server : AVAILABLE"
+if [[ "$ISC_AVAILABLE" == true && "$KEA_AVAILABLE" == true ]]; then
+
+    echo "Both implementations are available."
+    echo "1. ISC DHCP Server"
+    echo "2. Kea DHCP Server"
+    echo "3. Cancel"
+    read -r -p "Select option [1-3]: " CHOICE
+
+    case "$CHOICE" in
+        1) DHCP_TYPE="isc" ;;
+        2) DHCP_TYPE="kea" ;;
+        *) echo "Cancelled."; exit 0 ;;
+    esac
+
+elif [[ "$ISC_AVAILABLE" == true ]]; then
+
+    echo "ISC DHCP is available."
+    echo "1. Install and configure ISC DHCP"
+    echo "2. Cancel"
+    read -r -p "Select option [1-2]: " CHOICE
+
+    case "$CHOICE" in
+        1) DHCP_TYPE="isc" ;;
+        *) echo "Cancelled."; exit 0 ;;
+    esac
+
+elif [[ "$KEA_AVAILABLE" == true ]]; then
+
+    echo "ISC DHCP is not available in enabled repositories."
+    echo "Kea DHCP is available as an alternative."
+    echo "1. Continue with Kea DHCP"
+    echo "2. Cancel"
+    read -r -p "Select option [1-2]: " CHOICE
+
+    case "$CHOICE" in
+        1) DHCP_TYPE="kea" ;;
+        *) echo "Cancelled."; exit 0 ;;
+    esac
+
 else
-    echo "ISC DHCP Server : NOT AVAILABLE"
-fi
 
-
-if [[ "$KEA_AVAILABLE" == true ]]; then
-    echo "Kea DHCP Server : AVAILABLE"
-else
-    echo "Kea DHCP Server : NOT AVAILABLE"
-fi
-
-echo "------------------------------------------------------------"
-echo
-
-
-# ============================================================
-# NO DHCP SERVER AVAILABLE
-# ============================================================
-
-if [[ "$ISC_AVAILABLE" == false && "$KEA_AVAILABLE" == false ]]; then
-
-    echo
-    echo "ERROR: No DHCP server package is available."
-    echo
-    echo "Checked:"
-    echo "  - dhcp-server"
-    echo "  - kea"
-    echo
-    echo "Check your enabled repositories:"
-    echo "  dnf repolist"
-    echo
-
+    echo "ERROR: Neither ISC DHCP nor Kea is installed or available."
+    echo "Check enabled repositories using: dnf repolist"
     exit 1
 
 fi
 
+echo
+echo "Selected DHCP implementation: $DHCP_TYPE"
+read -r -p "Install/configure this implementation? (y/N): " CONFIRM
 
-# ============================================================
-# SELECT DHCP IMPLEMENTATION
-# ============================================================
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Cancelled."
+    exit 0
+fi
 
-DHCP_TYPE=""
+# -------------------- INSTALL SELECTED PACKAGE ---------------
 
+if [[ "$DHCP_TYPE" == "isc" ]]; then
 
-# ------------------------------------------------------------
-# CASE 1:
-# ISC and Kea both available
-# ------------------------------------------------------------
-
-if [[ "$ISC_AVAILABLE" == true && "$KEA_AVAILABLE" == true ]]; then
-
-    echo "============================================================"
-    echo "              DHCP SERVER SELECTION"
-    echo "============================================================"
-    echo
-    echo "1. Configure ISC DHCP Server"
-    echo "2. Configure Kea DHCP Server"
-    echo "3. Exit"
-    echo
-
-    while true; do
-
-        read -r -p "Enter your choice [1-3]: " CHOICE
-
-        case "$CHOICE" in
-
-            1)
-                DHCP_TYPE="isc"
-                break
-                ;;
-
-            2)
-                DHCP_TYPE="kea"
-                break
-                ;;
-
-            3)
-                echo
-                echo "Exiting. No DHCP configuration was changed."
-                exit 0
-                ;;
-
-            *)
-                echo
-                echo "Invalid choice. Please enter 1, 2, or 3."
-                ;;
-
-        esac
-
-    done
-
-
-# ------------------------------------------------------------
-# CASE 2:
-# ISC available, Kea unavailable
-# ------------------------------------------------------------
-
-elif [[ "$ISC_AVAILABLE" == true && "$KEA_AVAILABLE" == false ]]; then
-
-    echo "ISC DHCP Server is available."
-    echo "Kea DHCP Server is not available."
-    echo
-
-    read -r -p \
-        "Configure ISC DHCP Server? (Y/n): " CHOICE
-
-    if [[ "$CHOICE" =~ ^[Nn]$ ]]; then
-
-        echo
-        echo "Cancelled."
-        exit 0
-
+    if ! rpm -q dhcp-server >/dev/null 2>&1; then
+        echo "Installing ISC DHCP..."
+        dnf install -y dhcp-server
     fi
-
-    DHCP_TYPE="isc"
-
-
-# ------------------------------------------------------------
-# CASE 3:
-# ISC unavailable, Kea available
-# ------------------------------------------------------------
-
-elif [[ "$ISC_AVAILABLE" == false && "$KEA_AVAILABLE" == true ]]; then
-
-    echo
-    echo "============================================================"
-    echo "             ISC DHCP NOT AVAILABLE"
-    echo "============================================================"
-    echo
-    echo "The traditional ISC DHCP Server package"
-    echo "is NOT available from the configured repositories."
-    echo
-    echo "Kea DHCP Server IS available."
-    echo
-    echo "Would you like to continue with Kea DHCP?"
-    echo
-    echo "1. Yes - Configure Kea DHCP"
-    echo "2. No  - Exit"
-    echo
-
-    while true; do
-
-        read -r -p "Enter your choice [1-2]: " CHOICE
-
-        case "$CHOICE" in
-
-            1)
-                DHCP_TYPE="kea"
-                break
-                ;;
-
-            2)
-                echo
-                echo "Cancelled. No DHCP configuration was changed."
-                exit 0
-                ;;
-
-            *)
-                echo
-                echo "Invalid choice. Please enter 1 or 2."
-                ;;
-
-        esac
-
-    done
-
-fi
-
-
-# ============================================================
-# DISPLAY SELECTED SERVER
-# ============================================================
-
-echo
-echo "============================================================"
-
-if [[ "$DHCP_TYPE" == "isc" ]]; then
-    echo "       Selected DHCP Server : ISC DHCP Server"
-else
-    echo "       Selected DHCP Server : Kea DHCP Server"
-fi
-
-echo "============================================================"
-echo
-
-
-# ============================================================
-# ============================================================
-# ISC DHCP SERVER CONFIGURATION
-# ============================================================
-# ============================================================
-
-if [[ "$DHCP_TYPE" == "isc" ]]; then
-
-    echo "Installing ISC DHCP Server..."
-
-    dnf install -y dhcp-server
-
-
-    # --------------------------------------------------------
-    # Verify installation
-    # --------------------------------------------------------
 
     if ! command -v dhcpd >/dev/null 2>&1; then
-
-        echo
         echo "ERROR: dhcpd command was not found."
-        echo "ISC DHCP installation may have failed."
         exit 1
-
     fi
 
+    CONFIG_DIR="/etc/dhcp"
+    CONFIG_FILE="$CONFIG_DIR/dhcpd.conf"
+    SERVICE_NAME="dhcpd"
 
-    # --------------------------------------------------------
-    # Configuration files
-    # --------------------------------------------------------
+else
 
-    ISC_CONFIG="/etc/dhcp/dhcpd.conf"
+    if ! rpm -q kea >/dev/null 2>&1; then
+        echo "Installing Kea DHCP..."
+        dnf install -y kea
+    fi
 
-    ISC_CONFIG_DIR="/etc/dhcp"
+    if ! command -v kea-dhcp4 >/dev/null 2>&1; then
+        echo "ERROR: kea-dhcp4 command was not found."
+        exit 1
+    fi
 
-    ISC_TEMP_CONFIG="$(mktemp "${ISC_CONFIG_DIR}/dhcpd.conf.tmp.XXXXXX")"
+    CONFIG_DIR="/etc/kea"
+    CONFIG_FILE="$CONFIG_DIR/kea-dhcp4.conf"
+    SERVICE_NAME="kea-dhcp4"
 
+fi
 
-    # --------------------------------------------------------
-    # Generate ISC DHCP configuration
-    # --------------------------------------------------------
+mkdir -p "$CONFIG_DIR"
 
-    echo
-    echo "Generating ISC DHCP configuration..."
+TEMP_CONFIG="$(mktemp "${CONFIG_DIR}/dhcp-config.tmp.XXXXXX")"
 
+cleanup() {
+    if [[ -n "${TEMP_CONFIG:-}" && -f "$TEMP_CONFIG" ]]; then
+        rm -f "$TEMP_CONFIG"
+    fi
+}
+trap cleanup EXIT
 
-    cat > "$ISC_TEMP_CONFIG" <<EOF
-# ============================================================
-# ISC DHCP Server Configuration
-# Automatically generated by 03_dhcp_server.sh
-# ============================================================
+# -------------------- GENERATE CONFIGURATION -----------------
+
+echo
+echo "Generating $DHCP_TYPE configuration..."
+
+if [[ "$DHCP_TYPE" == "isc" ]]; then
+
+    # Convert comma-separated DNS addresses into ISC option syntax.
+    DNS_ISC="$(
+        python3 - "$DNS_SERVERS" <<'PY'
+import ipaddress, sys
+addresses = [x.strip() for x in sys.argv[1].split(",")]
+for address in addresses:
+    ipaddress.IPv4Address(address)
+print(", ".join(addresses))
+PY
+    )"
+
+    BROADCAST="$(
+        python3 - "$NETWORK" <<'PY'
+import ipaddress, sys
+print(ipaddress.ip_network(sys.argv[1], strict=False).broadcast_address)
+PY
+    )"
+
+    cat > "$TEMP_CONFIG" <<EOF
+# Generated by 03_dhcp_server.sh
 
 authoritative;
 
@@ -629,288 +550,39 @@ default-lease-time 4000;
 max-lease-time 7200;
 
 option domain-name "$DOMAIN_NAME";
-option domain-name-servers $DNS_SERVERS;
+option domain-name-servers $DNS_ISC;
 
-subnet $NETWORK netmask $NETMASK {
-
+subnet ${NETWORK%/*} netmask $NETMASK {
     range $RANGE_START $RANGE_END;
-
-    option routers $GATEWAY;
-
     option subnet-mask $NETMASK;
-
-    option broadcast-address ${NETWORK%.*}.255;
-
-    option domain-name "$DOMAIN_NAME";
-
-    option domain-name-servers $DNS_SERVERS;
+    option routers $GATEWAY;
+    option broadcast-address $BROADCAST;
 }
 EOF
 
-
-    # --------------------------------------------------------
-    # Validate ISC configuration
-    # --------------------------------------------------------
-
-    echo
     echo "Validating ISC DHCP configuration..."
 
-    if ! dhcpd -t -cf "$ISC_TEMP_CONFIG"; then
-
-        echo
+    if ! dhcpd -t -cf "$TEMP_CONFIG"; then
         echo "ERROR: ISC DHCP configuration validation failed."
-        echo
-        rm -f "$ISC_TEMP_CONFIG"
+        echo "Existing configuration has not been replaced."
         exit 1
-
     fi
 
-    echo "ISC DHCP configuration validation successful."
-
-
-    # --------------------------------------------------------
-    # Backup existing configuration
-    # --------------------------------------------------------
-
-    if [[ -f "$ISC_CONFIG" ]]; then
-
-        ISC_BACKUP="${ISC_CONFIG}.backup.$(date +%Y%m%d-%H%M%S)"
-
-        cp -a "$ISC_CONFIG" "$ISC_BACKUP"
-
-        echo
-        echo "Existing ISC configuration backed up to:"
-        echo "$ISC_BACKUP"
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Install validated configuration
-    # --------------------------------------------------------
-
-    install \
-        -o root \
-        -g root \
-        -m 0644 \
-        "$ISC_TEMP_CONFIG" \
-        "$ISC_CONFIG"
-
-
-    rm -f "$ISC_TEMP_CONFIG"
-
-
-    # --------------------------------------------------------
-    # Configure firewall
-    # --------------------------------------------------------
-
-    echo
-    echo "Configuring firewall..."
-
-
-    if systemctl is-active --quiet firewalld; then
-
-        FIREWALL_ZONE="$(
-            firewall-cmd \
-                --get-zone-of-interface="$INTERFACE" \
-                2>/dev/null || true
-        )
-
-
-        if [[ -z "$FIREWALL_ZONE" || "$FIREWALL_ZONE" == "no zone" ]]; then
-            FIREWALL_ZONE="$(firewall-cmd --get-default-zone)"
-        fi
-
-
-        firewall-cmd \
-            --permanent \
-            --zone="$FIREWALL_ZONE" \
-            --add-service=dhcp
-
-
-        firewall-cmd --reload
-
-
-        echo "DHCP firewall service enabled in zone: $FIREWALL_ZONE"
-
-    else
-
-        echo "WARNING: firewalld is not active."
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Enable and start ISC DHCP
-    # --------------------------------------------------------
-
-    echo
-    echo "Enabling and starting ISC DHCP Server..."
-
-
-    systemctl enable dhcpd
-
-    systemctl restart dhcpd
-
-
-    # --------------------------------------------------------
-    # Verify ISC service
-    # --------------------------------------------------------
-
-    if ! systemctl is-active --quiet dhcpd; then
-
-        echo
-        echo "ERROR: ISC DHCP Server is not running."
-        echo
-
-        systemctl --no-pager --full status dhcpd || true
-
-        echo
-        echo "Recent DHCP logs:"
-        journalctl -u dhcpd -n 50 --no-pager || true
-
-        exit 1
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Final ISC information
-    # --------------------------------------------------------
-
-    echo
-    echo "============================================================"
-    echo "           ISC DHCP SERVER CONFIGURED"
-    echo "============================================================"
-    echo
-
-    echo "Service status:"
-    systemctl --no-pager --full status dhcpd || true
-
-    echo
-    echo "Configuration file:"
-    echo "  $ISC_CONFIG"
-
-    echo
-    echo "DHCP network settings:"
-    echo "  Interface : $INTERFACE"
-    echo "  Server IP : $SERVER_IP"
-    echo "  Network   : $NETWORK"
-    echo "  Netmask   : $NETMASK"
-    echo "  Gateway   : $GATEWAY"
-    echo "  Pool      : $RANGE_START - $RANGE_END"
-    echo "  DNS       : $DNS_SERVERS"
-    echo "  Domain    : $DOMAIN_NAME"
-
-    echo
-    echo "Useful commands:"
-    echo "  systemctl status dhcpd"
-    echo "  journalctl -u dhcpd -f"
-    echo "  cat $ISC_CONFIG"
-
-fi
-
-
-# ============================================================
-# ============================================================
-# KEA DHCP SERVER CONFIGURATION
-# ============================================================
-# ============================================================
-
-if [[ "$DHCP_TYPE" == "kea" ]]; then
-
-    echo "Installing Kea DHCP Server..."
-
-
-    # --------------------------------------------------------
-    # Install Kea
-    # --------------------------------------------------------
-
-    if ! rpm -q kea >/dev/null 2>&1; then
-
-        dnf install -y kea
-
-    else
-
-        echo "Kea DHCP is already installed."
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Verify Kea command
-    # --------------------------------------------------------
-
-    if ! command -v kea-dhcp4 >/dev/null 2>&1; then
-
-        echo
-        echo "ERROR: kea-dhcp4 command was not found."
-        echo "Kea installation may have failed."
-        exit 1
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Kea configuration paths
-    # --------------------------------------------------------
-
-    KEA_CONFIG="/etc/kea/kea-dhcp4.conf"
-
-    KEA_CONFIG_DIR="/etc/kea"
-
-    KEA_LEASE_DIR="/var/lib/kea"
-
-
-    mkdir -p "$KEA_CONFIG_DIR"
-
-    mkdir -p "$KEA_LEASE_DIR"
-
-
-    # --------------------------------------------------------
-    # Temporary configuration
-    # --------------------------------------------------------
-
-    KEA_TEMP_CONFIG="$(
-        mktemp "${KEA_CONFIG_DIR}/kea-dhcp4.conf.tmp.XXXXXX"
-    )"
-
-
-    cleanup_kea()
-    {
-        if [[ -n "${KEA_TEMP_CONFIG:-}" &&
-              -f "$KEA_TEMP_CONFIG" ]]; then
-
-            rm -f "$KEA_TEMP_CONFIG"
-
-        fi
-    }
-
-
-    trap cleanup_kea EXIT
-
-
-    # --------------------------------------------------------
-    # Generate Kea JSON configuration
-    # --------------------------------------------------------
-
-    echo
-    echo "Generating Kea DHCP configuration..."
-
+else
 
     python3 - \
-        "$KEA_TEMP_CONFIG" \
+        "$TEMP_CONFIG" \
         "$INTERFACE" \
         "$NETWORK" \
         "$RANGE_START" \
         "$RANGE_END" \
+        "$NETMASK" \
         "$GATEWAY" \
         "$DNS_SERVERS" \
         "$DOMAIN_NAME" <<'PY'
-
 import json
+import ipaddress
 import sys
-
 
 (
     output_file,
@@ -918,363 +590,187 @@ import sys
     network,
     range_start,
     range_end,
+    netmask,
     gateway,
     dns_servers,
     domain
 ) = sys.argv[1:]
 
-
 config = {
-
     "Dhcp4": {
-
         "interfaces-config": {
-
-            "interfaces": [
-                interface
-            ]
-
+            "interfaces": [interface]
         },
-
-
         "lease-database": {
-
             "type": "memfile",
-
             "persist": True,
-
             "name": "/var/lib/kea/kea-leases4.csv"
-
         },
-
-
         "valid-lifetime": 4000,
-
         "renew-timer": 1000,
-
         "rebind-timer": 2000,
-
-
         "subnet4": [
-
             {
-
-                # Kea requires a unique subnet ID.
                 "id": 1,
-
                 "subnet": network,
-
-
                 "pools": [
-
                     {
-
-                        "pool":
-                            f"{range_start} - {range_end}"
-
+                        "pool": f"{range_start} - {range_end}"
                     }
-
                 ],
-
-
                 "option-data": [
-
                     {
-
+                        "name": "subnet-mask",
+                        "data": netmask
+                    },
+                    {
                         "name": "routers",
-
                         "data": gateway
-
                     },
-
-
                     {
-
-                        "name":
-                            "domain-name-servers",
-
+                        "name": "domain-name-servers",
                         "data": dns_servers
-
                     },
-
-
                     {
-
                         "name": "domain-name",
-
                         "data": domain
-
                     }
-
                 ]
-
             }
-
         ]
-
     }
-
 }
 
-
-with open(
-    output_file,
-    "w",
-    encoding="utf-8"
-) as file:
-
-    json.dump(
-        config,
-        file,
-        indent=4
-    )
-
+with open(output_file, "w", encoding="utf-8") as file:
+    json.dump(config, file, indent=4)
     file.write("\n")
-
 PY
 
-
-    # --------------------------------------------------------
-    # Validate Kea configuration
-    # --------------------------------------------------------
-
-    echo
     echo "Validating Kea DHCP configuration..."
 
-
-    if ! kea-dhcp4 -t "$KEA_TEMP_CONFIG"; then
-
-        echo
+    if ! kea-dhcp4 -t "$TEMP_CONFIG"; then
         echo "ERROR: Kea configuration validation failed."
-        echo "Existing configuration has NOT been replaced."
-        echo
-
+        echo "Existing configuration has not been replaced."
         exit 1
-
     fi
-
-
-    echo "Configuration validation successful."
-
-
-    # --------------------------------------------------------
-    # Backup existing configuration
-    # --------------------------------------------------------
-
-    if [[ -f "$KEA_CONFIG" ]]; then
-
-        KEA_BACKUP="${KEA_CONFIG}.backup.$(
-            date +%Y%m%d-%H%M%S
-        )"
-
-
-        cp -a \
-            "$KEA_CONFIG" \
-            "$KEA_BACKUP"
-
-
-        echo
-        echo "Existing configuration backed up to:"
-        echo "$KEA_BACKUP"
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Install validated configuration
-    # --------------------------------------------------------
-
-    install \
-        -o root \
-        -g root \
-        -m 0644 \
-        "$KEA_TEMP_CONFIG" \
-        "$KEA_CONFIG"
-
-
-    rm -f "$KEA_TEMP_CONFIG"
-
-    KEA_TEMP_CONFIG=""
-
-
-    # --------------------------------------------------------
-    # Configure firewall
-    # --------------------------------------------------------
-
-    echo
-    echo "Configuring firewall..."
-
-
-    if systemctl is-active --quiet firewalld; then
-
-        FIREWALL_ZONE="$(
-            firewall-cmd \
-                --get-zone-of-interface="$INTERFACE" \
-                2>/dev/null || true
-        )
-
-
-        if [[ -z "$FIREWALL_ZONE" ||
-              "$FIREWALL_ZONE" == "no zone" ]]; then
-
-            FIREWALL_ZONE="$(
-                firewall-cmd --get-default-zone
-            )"
-
-        fi
-
-
-        firewall-cmd \
-            --permanent \
-            --zone="$FIREWALL_ZONE" \
-            --add-service=dhcp
-
-
-        firewall-cmd --reload
-
-
-        echo "DHCP firewall service enabled in zone: $FIREWALL_ZONE"
-
-    else
-
-        echo "WARNING: firewalld is not active."
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Enable and start Kea
-    # --------------------------------------------------------
-
-    echo
-    echo "Enabling and starting Kea DHCPv4..."
-
-
-    systemctl enable kea-dhcp4
-
-    systemctl restart kea-dhcp4
-
-
-    # --------------------------------------------------------
-    # Verify Kea service
-    # --------------------------------------------------------
-
-    if ! systemctl is-active --quiet kea-dhcp4; then
-
-        echo
-        echo "ERROR: Kea DHCPv4 is not running."
-        echo
-
-        systemctl \
-            --no-pager \
-            --full \
-            status kea-dhcp4 || true
-
-
-        echo
-        echo "Recent Kea logs:"
-
-        journalctl \
-            -u kea-dhcp4 \
-            -n 50 \
-            --no-pager || true
-
-        exit 1
-
-    fi
-
-
-    # --------------------------------------------------------
-    # Final Kea information
-    # --------------------------------------------------------
-
-    echo
-    echo "============================================================"
-    echo "             KEA DHCP SERVER CONFIGURED"
-    echo "============================================================"
-    echo
-
-    echo "Service status:"
-
-    systemctl \
-        --no-pager \
-        --full \
-        status kea-dhcp4 || true
-
-
-    echo
-    echo "Listening on UDP port 67:"
-
-    if command -v ss >/dev/null 2>&1; then
-
-        ss -lunp |
-            grep -E '(:67[[:space:]]|:67$)' ||
-            echo "No UDP port 67 listener found."
-
-    fi
-
-
-    echo
-    echo "Configuration file:"
-    echo "  $KEA_CONFIG"
-
-
-    echo
-    echo "DHCP network settings:"
-    echo "  Interface : $INTERFACE"
-    echo "  Server IP : $SERVER_IP"
-    echo "  Network   : $NETWORK"
-    echo "  Netmask   : $NETMASK"
-    echo "  Gateway   : $GATEWAY"
-    echo "  Pool      : $RANGE_START - $RANGE_END"
-    echo "  DNS       : $DNS_SERVERS"
-    echo "  Domain    : $DOMAIN_NAME"
-
-
-    echo
-    echo "Useful commands:"
-    echo "  systemctl status kea-dhcp4"
-    echo "  journalctl -u kea-dhcp4 -f"
-    echo "  cat $KEA_CONFIG"
-    echo "  cat /var/lib/kea/kea-leases4.csv"
 
 fi
 
+echo "Configuration validation successful."
 
-# ============================================================
-# COMMON FINAL MESSAGE
-# ============================================================
+# -------------------- BACK UP OLD CONFIGURATION --------------
 
-echo
-echo "============================================================"
-echo "                 DHCP CONFIGURATION COMPLETE"
-echo "============================================================"
-echo
+if [[ -f "$CONFIG_FILE" ]]; then
+    BACKUP_FILE="${CONFIG_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$CONFIG_FILE" "$BACKUP_FILE"
+    echo "Existing configuration backed up to:"
+    echo "$BACKUP_FILE"
+fi
 
-echo "Selected DHCP server:"
-if [[ "$DHCP_TYPE" == "isc" ]]; then
-    echo "  ISC DHCP Server"
+install -o root -g root -m 0644 "$TEMP_CONFIG" "$CONFIG_FILE"
+rm -f "$TEMP_CONFIG"
+TEMP_CONFIG=""
+
+# -------------------- STOP OTHER DHCP IMPLEMENTATION ---------
+
+if [[ "$SERVICE_NAME" == "dhcpd" ]]; then
+    if systemctl list-unit-files kea-dhcp4.service --no-legend |
+        grep -q 'kea-dhcp4.service'; then
+        systemctl disable --now kea-dhcp4 2>/dev/null || true
+    fi
 else
-    echo "  Kea DHCP Server"
+    if systemctl list-unit-files dhcpd.service --no-legend |
+        grep -q 'dhcpd.service'; then
+        systemctl disable --now dhcpd 2>/dev/null || true
+    fi
+fi
+
+# -------------------- FIREWALL CONFIGURATION -----------------
+
+echo
+echo "Configuring firewall..."
+
+if systemctl is-active --quiet firewalld; then
+
+    FIREWALL_ZONE="$(
+        firewall-cmd --get-zone-of-interface="$INTERFACE" 2>/dev/null || true
+    )"
+
+    if [[ -z "$FIREWALL_ZONE" || "$FIREWALL_ZONE" == "no zone" ]]; then
+        FIREWALL_ZONE="$(firewall-cmd --get-default-zone)"
+    fi
+
+    firewall-cmd --permanent \
+        --zone="$FIREWALL_ZONE" \
+        --add-service=dhcp
+
+    firewall-cmd --reload
+
+    echo "DHCP firewall service enabled in zone: $FIREWALL_ZONE"
+else
+    echo "WARNING: firewalld is not active."
+fi
+
+# -------------------- ENABLE AND START SERVICE ---------------
+
+echo
+echo "Enabling and starting $SERVICE_NAME..."
+
+systemctl enable "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
+
+if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+    echo "ERROR: $SERVICE_NAME failed to start."
+    systemctl --no-pager --full status "$SERVICE_NAME" || true
+    journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
+    exit 1
+fi
+
+# -------------------- FINAL VERIFICATION ---------------------
+
+echo
+echo "============================================================"
+echo "                DHCP SERVER CONFIGURED"
+echo "============================================================"
+echo
+
+echo "Implementation : $DHCP_TYPE"
+echo "Service        : $SERVICE_NAME"
+echo "Interface      : $INTERFACE"
+echo "Server IP      : $SERVER_IP"
+echo "Network        : $NETWORK"
+echo "Subnet Mask    : $NETMASK"
+echo "Gateway        : $GATEWAY"
+echo "DHCP Pool      : $RANGE_START - $RANGE_END"
+echo "DNS Server     : $DNS_SERVERS"
+echo "Domain         : $DOMAIN_NAME"
+echo "Config File    : $CONFIG_FILE"
+
+echo
+echo "Service status:"
+systemctl --no-pager --full status "$SERVICE_NAME" || true
+
+echo
+echo "UDP port 67 listener:"
+if command -v ss >/dev/null 2>&1; then
+    ss -lunp | grep -E '(:67[[:space:]]|:67$)' ||
+        echo "No UDP port 67 listener detected. Check service logs."
 fi
 
 echo
-echo "Network:"
-echo "  Interface : $INTERFACE"
-echo "  Server IP : $SERVER_IP"
-echo "  Network   : $NETWORK"
-echo "  Gateway   : $GATEWAY"
-echo "  DHCP Pool : $RANGE_START - $RANGE_END"
-echo "  DNS       : $DNS_SERVERS"
+echo "Useful commands:"
+echo "  systemctl status $SERVICE_NAME"
+echo "  journalctl -u $SERVICE_NAME -f"
+echo "  cat $CONFIG_FILE"
+
+if [[ "$DHCP_TYPE" == "kea" ]]; then
+    echo "  cat /var/lib/kea/kea-leases4.csv"
+fi
 
 echo
 echo "NOTE:"
-echo "DHCP clients must be on the same Layer-2 network or"
-echo "reach this server through a correctly configured"
-echo "DHCP relay."
+echo "- Verify the gateway and DNS addresses are correct."
+echo "- Keep the server IP outside the DHCP pool."
+echo "- DHCP clients must be on this LAN or use a DHCP relay."
+echo "============================================================"
 
-echo
-echo "============================================================"
-echo "                     DONE"
-echo "============================================================"
-echo
