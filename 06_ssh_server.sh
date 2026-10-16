@@ -189,6 +189,7 @@ echo "Currently configured SSH port: ${CURRENT_PORT:-Unknown}"
 
 # ------------------------------------------------------------
 # Optional passwordless authentication
+# Supports same-machine and remote-machine SSH
 # ------------------------------------------------------------
 
 echo
@@ -204,16 +205,25 @@ if [[ "$PASSWORDLESS_CHOICE" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]; then
     mkdir -p /root/.ssh
     chmod 700 /root/.ssh
 
+    # Create a key if it does not exist. If only the public key is
+    # missing, recreate it from the existing private key.
     if [[ ! -f "$KEY_FILE" ]]; then
         ssh-keygen -t ed25519 -N "" -f "$KEY_FILE" || {
             echo "ERROR: SSH key generation failed."
             exit 1
         }
+    elif [[ ! -f "${KEY_FILE}.pub" ]]; then
+        ssh-keygen -y -f "$KEY_FILE" > "${KEY_FILE}.pub" || {
+            echo "ERROR: Could not recreate the public key."
+            exit 1
+        }
     fi
+
+    chmod 600 "$KEY_FILE"
+    chmod 644 "${KEY_FILE}.pub"
 
     read -r -p "Enter remote target (user@host): " REMOTE_TARGET
     read -r -p "Enter remote SSH port [22]: " REMOTE_PORT
-
     REMOTE_PORT=${REMOTE_PORT:-22}
 
     if [[ ! "$REMOTE_PORT" =~ ^[0-9]+$ ]] ||
@@ -222,29 +232,142 @@ if [[ "$PASSWORDLESS_CHOICE" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]; then
         exit 1
     fi
 
-    if [[ -z "$REMOTE_TARGET" ]]; then
-        echo "ERROR: Remote target cannot be empty."
+    if [[ "$REMOTE_TARGET" != *@* ]]; then
+        echo "ERROR: Enter the target as user@host."
         exit 1
     fi
 
-    if ssh-copy-id -i "${KEY_FILE}.pub" \
-        -p "$REMOTE_PORT" "$REMOTE_TARGET"; then
+    REMOTE_USER="${REMOTE_TARGET%@*}"
+    REMOTE_HOST="${REMOTE_TARGET##*@}"
 
-        echo
-        echo "Testing passwordless authentication..."
+    if [[ -z "$REMOTE_USER" || -z "$REMOTE_HOST" ]]; then
+        echo "ERROR: Invalid remote target."
+        exit 1
+    fi
 
-        if ssh -p "$REMOTE_PORT" \
-            -o BatchMode=yes \
-            -o ConnectTimeout=5 \
-            "$REMOTE_TARGET" "echo 'Passwordless SSH works'"; then
+    # Detect whether the destination is this machine by checking
+    # local hostnames and all local IPv4 addresses.
+    IS_LOCAL=false
+    LOCAL_HOSTNAME=$(hostname 2>/dev/null)
+    LOCAL_FQDN=$(hostname -f 2>/dev/null || true)
 
-            echo "SUCCESS: Passwordless authentication is working."
-        else
-            echo "WARNING: Key was copied, but authentication test failed."
+    if [[ "$REMOTE_HOST" == "localhost" ||
+          "$REMOTE_HOST" == "127.0.0.1" ||
+          "$REMOTE_HOST" == "::1" ||
+          "$REMOTE_HOST" == "$LOCAL_HOSTNAME" ||
+          ( -n "$LOCAL_FQDN" && "$REMOTE_HOST" == "$LOCAL_FQDN" ) ]]; then
+        IS_LOCAL=true
+    fi
+
+    LOCAL_IPS=$(ip -o -4 addr show |
+        awk '{split($4, a, "/"); print a[1]}')
+
+    if printf '%s\n' "$LOCAL_IPS" | grep -Fxq -- "$REMOTE_HOST"; then
+        IS_LOCAL=true
+    fi
+
+    # Also detect a hostname that resolves to one of this machine's IPs.
+    if [[ "$IS_LOCAL" == false ]]; then
+        while read -r RESOLVED_IP; do
+            if printf '%s\n' "$LOCAL_IPS" | grep -Fxq -- "$RESOLVED_IP"; then
+                IS_LOCAL=true
+                break
+            fi
+        done < <(getent ahostsv4 "$REMOTE_HOST" 2>/dev/null |
+                 awk '{print $1}' | sort -u)
+    fi
+
+    if [[ "$IS_LOCAL" == true ]]; then
+
+        # Same machine: install the key directly into the target
+        # account's authorized_keys, avoiding a password SSH login.
+        echo "Same-machine target detected."
+        echo "Installing the public key locally..."
+
+        USER_INFO=$(getent passwd "$REMOTE_USER")
+
+        if [[ -z "$USER_INFO" ]]; then
+            echo "ERROR: Local user '$REMOTE_USER' does not exist."
+            exit 1
         fi
+
+        USER_HOME=$(printf '%s\n' "$USER_INFO" | cut -d: -f6)
+        USER_GROUP=$(id -gn "$REMOTE_USER" 2>/dev/null)
+
+        if [[ -z "$USER_HOME" || ! -d "$USER_HOME" || -z "$USER_GROUP" ]]; then
+            echo "ERROR: Could not determine the home directory or group for '$REMOTE_USER'."
+            exit 1
+        fi
+
+        SSH_DIR="${USER_HOME}/.ssh"
+        AUTH_KEYS="${SSH_DIR}/authorized_keys"
+
+        mkdir -p "$SSH_DIR"
+        touch "$AUTH_KEYS"
+
+        # Avoid adding duplicate public keys.
+        if ! grep -qxF "$(cat "${KEY_FILE}.pub")" "$AUTH_KEYS"; then
+            cat "${KEY_FILE}.pub" >> "$AUTH_KEYS" || {
+                echo "ERROR: Could not install the public key."
+                exit 1
+            }
+            echo "Public key added to $AUTH_KEYS."
+        else
+            echo "Public key is already installed."
+        fi
+
+        chown -R "${REMOTE_USER}:${USER_GROUP}" "$SSH_DIR" || {
+            echo "ERROR: Could not set ownership on $SSH_DIR."
+            exit 1
+        }
+
+        chmod 700 "$SSH_DIR"
+        chmod 600 "$AUTH_KEYS"
+
+        if command -v restorecon >/dev/null 2>&1; then
+            restorecon -RF "$SSH_DIR" >/dev/null 2>&1 || true
+        fi
+
     else
-        echo "WARNING: ssh-copy-id failed."
-        echo "Check the remote username, host, port and credentials."
+
+        # Remote machine: copy the key. Restrict SSH to the intended
+        # identity to prevent 'Too many authentication failures'.
+        echo "Remote-machine target detected."
+        echo "Copying the public key to ${REMOTE_TARGET}..."
+
+        if ! ssh-copy-id \
+            -i "${KEY_FILE}.pub" \
+            -o "IdentitiesOnly=yes" \
+            -o "IdentityFile=${KEY_FILE}" \
+            -p "$REMOTE_PORT" \
+            "$REMOTE_TARGET"; then
+
+            echo "ERROR: ssh-copy-id failed."
+            echo "Check the remote username, host, port and credentials."
+            echo "Confirm that the remote account can log in using SSH."
+            exit 1
+        fi
+    fi
+
+    # Test using public-key authentication only.
+    echo
+    echo "Testing passwordless authentication..."
+
+    if ssh \
+        -i "$KEY_FILE" \
+        -o IdentitiesOnly=yes \
+        -o PreferredAuthentications=publickey \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -p "$REMOTE_PORT" \
+        "$REMOTE_TARGET" \
+        "echo 'Passwordless SSH works'"; then
+
+        echo "SUCCESS: Passwordless SSH authentication is working."
+    else
+        echo "ERROR: Passwordless authentication test failed."
+        echo "Check the SSH port, public key, authorized_keys permissions,"
+        echo "and the server's PubkeyAuthentication setting."
     fi
 
 else
