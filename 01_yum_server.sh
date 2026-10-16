@@ -280,8 +280,9 @@ else
     echo "Check firewall/network rules if clients cannot connect."
 fi
 
+
 # ------------------------------------------------------------
-# 14. Display Server IP and Repository URLs
+# 14. Display Server IP and Correct Repository URLs
 # ------------------------------------------------------------
 
 echo
@@ -291,19 +292,24 @@ echo "============================================================"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 
+# Convert the filesystem path into an HTTP URL path.
+# Apache document root: /var/www/html
+HTTP_URL_PATH="${HTTP_PATH#/var/www/html}"
+
 echo
 echo "Server IP: $SERVER_IP"
 echo "Repository directory: $HTTP_PATH"
 echo
 
 for i in "${PACKAGE_NAME[@]}"; do
-    echo "$i: http://$SERVER_IP/${HTTP_PATH#/}/$i/"
+    echo "$i: http://$SERVER_IP${HTTP_URL_PATH}/$i/"
 done
 
 echo
 echo "Test repository metadata using:"
+
 for i in "${PACKAGE_NAME[@]}"; do
-    echo "curl -I http://$SERVER_IP/${HTTP_PATH#/}/$i/repodata/repomd.xml"
+    echo "curl -I http://$SERVER_IP${HTTP_URL_PATH}/$i/repodata/repomd.xml"
 done
 
 echo
