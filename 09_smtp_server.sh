@@ -14,15 +14,13 @@ DEFAULT_SMTP_PORT="25"
 DEFAULT_INET_INTERFACES="all"
 DEFAULT_FIREWALL_SERVICE="smtp"
 
-# -------------------- COLORS -------------------------------
-
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# -------------------- FUNCTIONS -----------------------------
+# -------------------- FUNCTIONS ------------------------------
 
 print_line() {
     echo "============================================================"
@@ -49,15 +47,15 @@ ask_value() {
     echo "${result:-$default}"
 }
 
-# -------------------- ROOT CHECK ----------------------------
+# -------------------- ROOT CHECK -----------------------------
 
 if [[ $EUID -ne 0 ]]; then
-    error "Please execute this script as root."
+    error "Run this script as root."
     echo "Example: sudo bash 09_smtp_server.sh"
     exit 1
 fi
 
-# -------------------- OS CHECK ------------------------------
+# -------------------- OS CHECK -------------------------------
 
 if [[ ! -f /etc/os-release ]]; then
     error "Cannot identify the operating system."
@@ -68,21 +66,41 @@ source /etc/os-release
 
 if [[ "$ID" != "rocky" && "$ID" != "rhel" &&
       "${ID_LIKE:-}" != *"rhel"* ]]; then
-    error "This script is intended for RHEL / Rocky Linux."
+    error "This script supports RHEL / Rocky Linux."
     exit 1
 fi
 
-# -------------------- HEADER --------------------------------
+# -------------------- DETECT SERVER IP -----------------------
+
+SERVER_IP=$(
+    ip -4 route get 1.1.1.1 2>/dev/null |
+    awk '{
+        for (i=1; i<=NF; i++)
+            if ($i=="src") { print $(i+1); exit }
+    }'
+)
+
+if [[ -z "$SERVER_IP" ]]; then
+    SERVER_IP=$(
+        ip -o -4 addr show scope global |
+        awk 'NR==1 {
+            split($4,a,"/");
+            print a[1]
+        }'
+    )
+fi
+
+SERVER_IP=${SERVER_IP:-127.0.0.1}
+
+# -------------------- HEADER ---------------------------------
 
 clear
 print_line
 echo "          INTERACTIVE SMTP SERVER SETUP"
 echo "          RHEL / ROCKY LINUX"
 print_line
-echo "Press Enter to accept the displayed default values."
+echo "Press Enter to accept the displayed defaults."
 echo
-
-# -------------------- SYSTEM INFORMATION --------------------
 
 echo -e "${BLUE}Current Host Information${NC}"
 hostnamectl
@@ -90,7 +108,7 @@ echo
 ip -br addr
 echo
 
-# -------------------- USER CONFIGURATION --------------------
+# -------------------- USER CONFIGURATION ---------------------
 
 SMTP_HOST_SHORT=$(ask_value \
     "SMTP server hostname (short name)" "$DEFAULT_HOSTNAME")
@@ -108,20 +126,22 @@ SMTP_INET_INTERFACES=$(ask_value \
 FIREWALL_SERVICE=$(ask_value \
     "Firewall service name" "$DEFAULT_FIREWALL_SERVICE")
 
+# Automatically construct the FQDN and recipient address.
 SMTP_HOSTNAME="${SMTP_HOST_SHORT}.${SMTP_DOMAIN}"
-SMTP_ORIGIN='$mydomain'
-SMTP_DESTINATION="\$myhostname, localhost.\$mydomain, localhost, \$mydomain"
+SMTP_RECIPIENT="root@${SMTP_DOMAIN}"
 
 echo
 print_line
 echo "             CONFIGURATION SUMMARY"
 print_line
-echo "Hostname            : $SMTP_HOSTNAME"
+echo "SMTP Hostname       : $SMTP_HOSTNAME"
 echo "Domain              : $SMTP_DOMAIN"
+echo "Server IP           : $SERVER_IP"
 echo "Mail origin         : $SMTP_DOMAIN"
 echo "Listening port      : $SMTP_PORT"
 echo "Network interfaces  : $SMTP_INET_INTERFACES"
 echo "Firewall service    : $FIREWALL_SERVICE"
+echo "Test recipient      : $SMTP_RECIPIENT"
 print_line
 echo
 
@@ -132,7 +152,7 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# -------------------- VALIDATION ----------------------------
+# -------------------- VALIDATION -----------------------------
 
 if [[ ! "$SMTP_PORT" =~ ^[0-9]+$ ]] ||
    (( SMTP_PORT < 1 || SMTP_PORT > 65535 )); then
@@ -152,8 +172,19 @@ fi
 
 if [[ "$SMTP_INET_INTERFACES" != "all" &&
       "$SMTP_INET_INTERFACES" != "loopback-only" ]]; then
-    error "Use 'all' or 'loopback-only' for network interfaces."
+    error "Use 'all' or 'loopback-only'."
     exit 1
+fi
+
+if [[ "$SMTP_PORT" != "25" ]]; then
+    error "This script currently configures the standard SMTP port 25 only."
+    error "Use port 25 to ensure the listener and firewall match."
+    exit 1
+fi
+
+if [[ "$SMTP_INET_INTERFACES" == "loopback-only" ]]; then
+    warning "Loopback-only prevents connections from other machines."
+    warning "Choose 'all' if remote client testing is required."
 fi
 
 # -------------------- INSTALL PACKAGES -----------------------
@@ -169,7 +200,7 @@ fi
 rpm -q postfix
 rpm -q mutt
 
-# -------------------- BACKUP CONFIGURATION ------------------
+# -------------------- BACKUP CONFIGURATION -------------------
 
 echo
 echo "[2/7] Backing up existing Postfix configuration..."
@@ -178,10 +209,10 @@ POSTFIX_CONFIG="/etc/postfix/main.cf"
 BACKUP_FILE="${POSTFIX_CONFIG}.backup.$(date +%Y%m%d_%H%M%S)"
 
 if [[ -f "$POSTFIX_CONFIG" ]]; then
-    cp -a "$POSTFIX_CONFIG" "$BACKUP_FILE" || {
-        error "Could not back up $POSTFIX_CONFIG"
+    if ! cp -a "$POSTFIX_CONFIG" "$BACKUP_FILE"; then
+        error "Could not back up Postfix configuration."
         exit 1
-    }
+    fi
     success "Backup created: $BACKUP_FILE"
 fi
 
@@ -190,7 +221,6 @@ fi
 echo
 echo "[3/7] Configuring Postfix..."
 
-# Update existing settings or append missing settings.
 set_postfix_option() {
     local key="$1"
     local value="$2"
@@ -211,22 +241,14 @@ set_postfix_option "inet_interfaces" "$SMTP_INET_INTERFACES"
 set_postfix_option "mydestination" \
     '$myhostname, localhost.$mydomain, localhost, $mydomain'
 
-# Set a custom SMTP port in master.cf when not using port 25.
-# The default Postfix SMTP service is already configured on port 25.
-if [[ "$SMTP_PORT" != "25" ]]; then
-    warning "A non-default SMTP port requires master.cf configuration."
-    warning "This script leaves master.cf unchanged; configure and verify"
-    warning "the custom listener separately before opening the firewall."
-fi
-
-# -------------------- VERIFY CONFIGURATION ------------------
+# -------------------- VERIFY CONFIGURATION -------------------
 
 echo
 echo "[4/7] Checking Postfix configuration..."
 
 if ! postfix check; then
     error "Postfix configuration validation failed."
-    warning "Restore the backup if necessary: $BACKUP_FILE"
+    warning "Original configuration backup: $BACKUP_FILE"
     exit 1
 fi
 
@@ -236,7 +258,7 @@ postconf myorigin
 postconf inet_interfaces
 postconf mydestination
 
-# -------------------- START POSTFIX -------------------------
+# -------------------- START POSTFIX --------------------------
 
 echo
 echo "[5/7] Enabling and starting Postfix..."
@@ -248,7 +270,7 @@ if ! systemctl enable --now postfix; then
 fi
 
 systemctl --no-pager --full status postfix
-success "Postfix service is enabled and running."
+success "Postfix is enabled and running."
 
 # -------------------- FIREWALL CONFIGURATION -----------------
 
@@ -256,13 +278,16 @@ echo
 echo "[6/7] Configuring firewalld..."
 
 if systemctl is-active --quiet firewalld; then
-    if [[ "$SMTP_PORT" == "25" ]]; then
-        firewall-cmd --permanent --add-service="$FIREWALL_SERVICE"
-    else
-        firewall-cmd --permanent --add-port="${SMTP_PORT}/tcp"
+    if ! firewall-cmd --permanent --add-service="$FIREWALL_SERVICE"; then
+        error "Could not add SMTP firewall service."
+        exit 1
     fi
 
-    firewall-cmd --reload
+    if ! firewall-cmd --reload; then
+        error "Firewall reload failed."
+        exit 1
+    fi
+
     firewall-cmd --list-all
 else
     warning "firewalld is not active. Firewall was not changed."
@@ -287,7 +312,7 @@ echo
 echo "Postfix logs:"
 journalctl -u postfix -n 20 --no-pager
 
-# -------------------- COMPLETION ----------------------------
+# -------------------- COMPLETION -----------------------------
 
 echo
 print_line
@@ -295,23 +320,52 @@ success "SMTP SERVER SETUP COMPLETED"
 print_line
 
 echo "SMTP Hostname : $SMTP_HOSTNAME"
+echo "Server IP     : $SERVER_IP"
 echo "Domain        : $SMTP_DOMAIN"
 echo "SMTP Port     : $SMTP_PORT"
+echo "Recipient     : $SMTP_RECIPIENT"
 echo "Config File   : $POSTFIX_CONFIG"
 echo "Backup File   : $BACKUP_FILE"
+
 echo
-echo "Useful commands:"
+echo "Useful server commands:"
 echo "  postfix check"
 echo "  postconf -n"
 echo "  systemctl status postfix"
-echo "  ss -ltnp | grep ':25'"
+echo "  ss -ltnp | grep ':${SMTP_PORT}'"
 echo "  journalctl -u postfix --no-pager"
+
+# -------------------- CLIENT VERIFICATION --------------------
+
 echo
-echo "Test mail locally:"
-echo "  echo 'SMTP test email' | mutt -s 'SMTP Test' recipient@example.com"
+print_line
+echo "       SMTP CLIENT MACHINE VERIFICATION"
+print_line
+
+echo "Run these commands on a DIFFERENT Rocky Linux machine."
 echo
-warning "Local SMTP setup does not guarantee external email delivery."
-warning "External delivery may require DNS, a valid mail identity, TLS,"
-warning "relay configuration, and permission to send outbound SMTP."
+echo "1. Install Mutt and netcat:"
+echo "   dnf install mutt nmap-ncat -y"
+echo
+echo "2. Verify connectivity to the SMTP server:"
+printf '   nc -vz %s %s\n' "$SERVER_IP" "$SMTP_PORT"
+echo
+echo "3. Send a test email through this SMTP server:"
+printf '   echo "Hello from my client Rocky Linux machine!" | \\\n'
+printf '   mutt -e '\''set smtp_url="smtp://%s:%s"'\'' \\\n' \
+    "$SERVER_IP" "$SMTP_PORT"
+printf '        -s "SMTP Client Test" %s\n' "$SMTP_RECIPIENT"
+
+echo
+echo "4. Check the mail queue ON THE SMTP SERVER:"
+echo "   postqueue -p"
+echo
+echo "5. Check Postfix logs ON THE SMTP SERVER:"
+echo "   journalctl -u postfix -n 30 --no-pager"
+echo
+warning "Ensure the client can reach the server IP and TCP port."
+warning "The recipient must exist or resolve to a local mailbox."
+warning "This basic setup does not configure authenticated SMTP relay."
+warning "External email delivery may require DNS, TLS, and a mail relay."
 print_line
 
