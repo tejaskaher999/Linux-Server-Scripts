@@ -1,315 +1,417 @@
 #!/bin/bash
+
 # ============================================================
 # Script Name : 04_nfs_server.sh
-# Purpose     : Install and configure an NFS Server
-# OS          : Rocky Linux / RHEL
-#
-# Features:
-#   1. Install nfs-utils.
-#   2. Configure NFS export directory and client network.
-#   3. Create a demo file.
-#   4. Update /etc/exports without duplicate entries.
-#   5. Validate and export NFS shares.
-#   6. Enable and start nfs-server.
-#   7. Configure firewall when firewalld is active.
-#   8. Verify the exported shares and service status.
-#
-# Run as root.
+# Purpose     : Configure an NFS server on Rocky Linux
+# Features    :
+#   1. Detect server IP automatically
+#   2. Detect active network interface and network CIDR
+#   3. Allow detected values to be edited
+#   4. Install NFS utilities
+#   5. Configure /etc/exports safely with a backup
+#   6. Enable and start NFS service
+#   7. Configure firewall
+#   8. Verify exports and display client mount command
 # ============================================================
 
 set -Eeuo pipefail
 
-# -------------------- VARIABLES ------------------------------
+# ------------------------------------------------------------
+# 1. DEFAULT CONFIGURATION
+# ------------------------------------------------------------
 
-# Change these values according to your requirements.
 FILE_PATH="/etc/exports"
 SHARE_DIR_PATH="/srv/nfs"
 SHARE_DEMO_FILE="export.txt"
-CLIENT_NETWORK="192.168.0.0/24"
-
-# NFS permissions:
-# rw            = Read and write
-# sync          = Write changes to stable storage before replying
-# root_squash   = Map client root access to an unprivileged user
-# no_subtree_check = Disable subtree checking
 EXPORT_OPTIONS="rw,sync,root_squash,no_subtree_check"
 
-# -------------------- ROOT CHECK -----------------------------
+# Fallback values used only when automatic detection fails.
+SERVER_INTERFACE=""
+SERVER_IP="192.168.0.1"
+CLIENT_NETWORK="192.168.0.0/24"
 
-if [[ "$EUID" -ne 0 ]]; then
-    echo "ERROR: Run this script as root."
-    echo "Example: sudo ./04_nfs_server.sh"
+# ------------------------------------------------------------
+# 2. HELPER FUNCTIONS
+# ------------------------------------------------------------
+
+print_line() {
+    printf '%*s\n' 60 '' | tr ' ' '='
+}
+
+error() {
+    echo "ERROR: $*" >&2
     exit 1
-fi
+}
 
-# -------------------- REQUIRED COMMANDS ----------------------
-
-for cmd in dnf systemctl python3; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "ERROR: Required command '$cmd' is missing."
-        exit 1
-    fi
-done
-
-echo
-echo "============================================================"
-echo "                 NFS SERVER CONFIGURATION"
-echo "============================================================"
-echo
-
-# -------------------- EDIT CONFIGURATION ---------------------
-
-echo "Current configuration:"
-echo "------------------------------------------------------------"
-echo "Exports file    : $FILE_PATH"
-echo "Shared folder   : $SHARE_DIR_PATH"
-echo "Demo file       : $SHARE_DEMO_FILE"
-echo "Client network  : $CLIENT_NETWORK"
-echo "Export options  : $EXPORT_OPTIONS"
-echo "------------------------------------------------------------"
-echo
-echo "Press ENTER to keep each current value."
-echo
-
-read -r -p "Shared directory [$SHARE_DIR_PATH]: " INPUT_VALUE
-SHARE_DIR_PATH="${INPUT_VALUE:-$SHARE_DIR_PATH}"
-
-read -r -p "Allowed client network/CIDR [$CLIENT_NETWORK]: " INPUT_VALUE
-CLIENT_NETWORK="${INPUT_VALUE:-$CLIENT_NETWORK}"
-
-read -r -p "Demo filename [$SHARE_DEMO_FILE]: " INPUT_VALUE
-SHARE_DEMO_FILE="${INPUT_VALUE:-$SHARE_DEMO_FILE}"
-
-# -------------------- VALIDATE INPUT -------------------------
-
-if [[ "$SHARE_DIR_PATH" != /* ||
-      "$SHARE_DIR_PATH" == "/" ||
-      "$SHARE_DIR_PATH" == *" "* ]]; then
-    echo "ERROR: Shared directory must be an absolute path,"
-    echo "must not be /, and must not contain spaces."
-    exit 1
-fi
-
-if [[ "$SHARE_DEMO_FILE" == */* ||
-      -z "$SHARE_DEMO_FILE" ||
-      "$SHARE_DEMO_FILE" == "." ||
-      "$SHARE_DEMO_FILE" == ".." ]]; then
-    echo "ERROR: Enter a filename, not a directory path."
-    exit 1
-fi
-
-if ! python3 - "$CLIENT_NETWORK" <<'PY'
+is_valid_ipv4() {
+    python3 - "$1" <<'PY'
 import ipaddress
 import sys
 
 try:
-    network = ipaddress.ip_network(sys.argv[1], strict=True)
-    if network.version != 4:
-        raise ValueError("Only IPv4 client networks are supported.")
-except Exception as exc:
-    print(f"ERROR: Invalid client network: {exc}")
+    ipaddress.IPv4Address(sys.argv[1])
+except ValueError:
     sys.exit(1)
 PY
-then
-    exit 1
+}
+
+is_valid_cidr() {
+    python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+try:
+    ipaddress.IPv4Network(sys.argv[1], strict=False)
+except ValueError:
+    sys.exit(1)
+PY
+}
+
+detect_network() {
+    python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+try:
+    interface = ipaddress.IPv4Interface(sys.argv[1])
+    print(interface.network)
+except ValueError:
+    sys.exit(1)
+PY
+}
+
+# ------------------------------------------------------------
+# 3. CHECK ROOT PRIVILEGES AND REQUIRED COMMANDS
+# ------------------------------------------------------------
+
+if [[ "$EUID" -ne 0 ]]; then
+    error "Run this script as root: sudo ./04_nfs_server.sh"
 fi
+
+for command in ip python3 systemctl dnf awk sed grep; do
+    command -v "$command" >/dev/null 2>&1 ||
+        error "Required command not found: $command"
+done
+
+# ------------------------------------------------------------
+# 4. AUTOMATICALLY DETECT SERVER INTERFACE AND IP
+# ------------------------------------------------------------
+
+echo
+print_line
+echo "             NFS SERVER CONFIGURATION"
+print_line
+echo
+echo "Detecting network configuration..."
+
+# Prefer the interface used by the default route.
+SERVER_INTERFACE="$(
+    ip route show default 2>/dev/null |
+    awk 'NR == 1 {print $5; exit}'
+)"
+
+# If there is no default route, use the first interface
+# that has a global IPv4 address.
+if [[ -z "$SERVER_INTERFACE" ]] ||
+   ! ip -o -4 addr show dev "$SERVER_INTERFACE" scope global \
+        2>/dev/null | grep -q 'inet'; then
+    SERVER_INTERFACE="$(
+        ip -o -4 addr show scope global 2>/dev/null |
+        awk 'NR == 1 {print $2; exit}'
+    )"
+fi
+
+DETECTED_CIDR=""
+
+if [[ -n "$SERVER_INTERFACE" ]]; then
+    DETECTED_CIDR="$(
+        ip -o -4 addr show dev "$SERVER_INTERFACE" scope global \
+            2>/dev/null |
+        awk 'NR == 1 {print $4; exit}'
+    )"
+fi
+
+if [[ -n "$DETECTED_CIDR" ]]; then
+    SERVER_IP="${DETECTED_CIDR%/*}"
+    CLIENT_NETWORK="$(detect_network "$DETECTED_CIDR")" ||
+        error "Could not calculate the network CIDR."
+else
+    echo "WARNING: Could not automatically detect a global IPv4 address."
+    echo "You can enter the server IP and client network manually."
+fi
+
+# ------------------------------------------------------------
+# 5. DISPLAY AND EDIT CONFIGURATION
+# ------------------------------------------------------------
+
+echo
+echo "Automatically detected configuration:"
+print_line
+echo "Network interface : ${SERVER_INTERFACE:-Not detected}"
+echo "NFS server IP     : $SERVER_IP"
+echo "Shared directory  : $SHARE_DIR_PATH"
+echo "Demo file         : $SHARE_DEMO_FILE"
+echo "Client network    : $CLIENT_NETWORK"
+echo "Exports file      : $FILE_PATH"
+echo "Export options    : $EXPORT_OPTIONS"
+print_line
+echo
+echo "Press ENTER to keep each current value."
+echo
+
+read -r -p "NFS server IP [$SERVER_IP]: " INPUT_SERVER_IP
+SERVER_IP="${INPUT_SERVER_IP:-$SERVER_IP}"
+
+read -r -p "Shared directory [$SHARE_DIR_PATH]: " INPUT_SHARE_DIR
+SHARE_DIR_PATH="${INPUT_SHARE_DIR:-$SHARE_DIR_PATH}"
+
+read -r -p "Allowed client network/CIDR [$CLIENT_NETWORK]: " INPUT_NETWORK
+CLIENT_NETWORK="${INPUT_NETWORK:-$CLIENT_NETWORK}"
+
+read -r -p "Demo filename [$SHARE_DEMO_FILE]: " INPUT_DEMO_FILE
+SHARE_DEMO_FILE="${INPUT_DEMO_FILE:-$SHARE_DEMO_FILE}"
+
+# ------------------------------------------------------------
+# 6. VALIDATE INPUTS
+# ------------------------------------------------------------
+
+is_valid_ipv4 "$SERVER_IP" ||
+    error "Invalid NFS server IPv4 address: $SERVER_IP"
+
+is_valid_cidr "$CLIENT_NETWORK" ||
+    error "Invalid client network/CIDR: $CLIENT_NETWORK"
+
+if [[ "$SHARE_DIR_PATH" != /* ]] ||
+   [[ "$SHARE_DIR_PATH" == "/" ]] ||
+   [[ "$SHARE_DIR_PATH" == *" "* ]] ||
+   [[ "$SHARE_DIR_PATH" == *"("* ]] ||
+   [[ "$SHARE_DIR_PATH" == *")"* ]]; then
+    error "Enter a valid absolute shared directory path without spaces or parentheses."
+fi
+
+if [[ "$SHARE_DEMO_FILE" == */* ]] ||
+   [[ -z "$SHARE_DEMO_FILE" ]] ||
+   [[ "$SHARE_DEMO_FILE" == "." ]] ||
+   [[ "$SHARE_DEMO_FILE" == ".." ]]; then
+    error "Demo filename must be a filename, not a directory path."
+fi
+
+# ------------------------------------------------------------
+# 7. SHOW FINAL CONFIGURATION AND ASK FOR CONFIRMATION
+# ------------------------------------------------------------
 
 echo
 echo "Final NFS configuration:"
-echo "  Directory      : $SHARE_DIR_PATH"
-echo "  Client network : $CLIENT_NETWORK"
-echo "  Demo file      : $SHARE_DEMO_FILE"
+print_line
+echo "Network interface : ${SERVER_INTERFACE:-Not detected}"
+echo "NFS server IP     : $SERVER_IP"
+echo "Shared directory  : $SHARE_DIR_PATH"
+echo "Client network    : $CLIENT_NETWORK"
+echo "Demo file         : $SHARE_DEMO_FILE"
+echo "Exports file      : $FILE_PATH"
+echo "Export options    : $EXPORT_OPTIONS"
+print_line
 echo
-
 echo "IMPORTANT:"
-echo "- Only the specified client network will be exported."
-echo "- The export is read/write; file permissions still apply."
+echo "- Only clients matching the configured network are exported."
+echo "- The export is read/write; filesystem permissions still apply."
 echo "- Use a trusted network and appropriate client permissions."
 echo
 
 read -r -p "Continue with NFS server setup? (y/N): " CONFIRM
 
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo "Cancelled. No NFS configuration was changed."
-    exit 0
-fi
+case "$CONFIRM" in
+    y|Y|yes|YES|Yes) ;;
+    *)
+        echo "Setup cancelled. No NFS configuration changes were made."
+        exit 0
+        ;;
+esac
 
-# -------------------- INSTALL NFS UTILITIES ------------------
+# ------------------------------------------------------------
+# 8. INSTALL NFS UTILITIES
+# ------------------------------------------------------------
 
 echo
 echo "Installing NFS utilities..."
-
 dnf install -y nfs-utils
 
-# Verify required NFS commands.
-for cmd in exportfs showmount; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "ERROR: Required NFS command '$cmd' was not installed."
-        exit 1
-    fi
-done
-
-# -------------------- CREATE SHARED DIRECTORY ----------------
+# ------------------------------------------------------------
+# 9. CREATE SHARED DIRECTORY AND DEMO FILE
+# ------------------------------------------------------------
 
 echo
 echo "Creating NFS shared directory..."
 
 mkdir -p "$SHARE_DIR_PATH"
-touch "$SHARE_DIR_PATH/$SHARE_DEMO_FILE"
-
-# Safer default permissions than chmod 777.
-# Root owns the directory; client write access also depends
-# on the UID/GID and permissions used by NFS clients.
 chmod 0755 "$SHARE_DIR_PATH"
-chmod 0644 "$SHARE_DIR_PATH/$SHARE_DEMO_FILE"
 
-echo "Shared directory created: $SHARE_DIR_PATH"
-echo "Demo file created      : $SHARE_DIR_PATH/$SHARE_DEMO_FILE"
+DEMO_FILE_PATH="$SHARE_DIR_PATH/$SHARE_DEMO_FILE"
 
-# -------------------- CONFIGURE /etc/exports -----------------
+if [[ ! -e "$DEMO_FILE_PATH" ]]; then
+    cat > "$DEMO_FILE_PATH" <<EOF
+NFS server demo file
+Server IP: $SERVER_IP
+Shared directory: $SHARE_DIR_PATH
+Allowed client network: $CLIENT_NETWORK
+Created by: 04_nfs_server.sh
+EOF
+    chmod 0644 "$DEMO_FILE_PATH"
+    echo "Demo file created: $DEMO_FILE_PATH"
+else
+    echo "Demo file already exists; keeping its contents: $DEMO_FILE_PATH"
+fi
+
+echo "Shared directory ready: $SHARE_DIR_PATH"
+
+# ------------------------------------------------------------
+# 10. BACK UP /etc/exports
+# ------------------------------------------------------------
 
 echo
 echo "Configuring NFS exports..."
 
-# Ensure the exports file exists.
-touch "$FILE_PATH"
+if [[ -f "$FILE_PATH" ]]; then
+    BACKUP_FILE="${FILE_PATH}.backup.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$FILE_PATH" "$BACKUP_FILE"
+    echo "Backup created: $BACKUP_FILE"
+else
+    touch "$FILE_PATH"
+    echo "Created $FILE_PATH"
+fi
 
-# Preserve a backup before changing the file.
-BACKUP_FILE="${FILE_PATH}.backup.$(date +%Y%m%d-%H%M%S)"
-cp -a "$FILE_PATH" "$BACKUP_FILE"
+# ------------------------------------------------------------
+# 11. UPDATE OUR MANAGED EXPORT BLOCK
+# ------------------------------------------------------------
 
-echo "Backup created: $BACKUP_FILE"
+# These markers allow the script to update its own entry
+# without deleting unrelated exports in /etc/exports.
 
-# Use a managed block so repeated script runs do not append
-# duplicate entries.
-python3 - \
-    "$FILE_PATH" \
-    "$SHARE_DIR_PATH" \
-    "$CLIENT_NETWORK" \
-    "$EXPORT_OPTIONS" <<'PY'
+python3 - "$FILE_PATH" "$SHARE_DIR_PATH" "$CLIENT_NETWORK" "$EXPORT_OPTIONS" <<'PY'
+import os
 import sys
+import tempfile
 
-file_path, share_dir, client_network, options = sys.argv[1:]
+exports_file, share_dir, network, options = sys.argv[1:]
 
 begin = "# BEGIN managed by 04_nfs_server.sh"
 end = "# END managed by 04_nfs_server.sh"
 
-block = [
-    begin,
-    f"{share_dir} {client_network}({options})",
-    end,
-]
+with open(exports_file, "r", encoding="utf-8") as file:
+    content = file.read()
 
-with open(file_path, "r", encoding="utf-8") as file:
-    lines = file.read().splitlines()
-
-# Remove only the previous block owned by this script.
-updated = []
+lines = content.splitlines()
+result = []
 inside_block = False
 
 for line in lines:
     if line.strip() == begin:
         inside_block = True
         continue
-
-    if inside_block:
-        if line.strip() == end:
-            inside_block = False
+    if line.strip() == end:
+        inside_block = False
         continue
+    if not inside_block:
+        result.append(line)
 
-    updated.append(line)
+# Remove only blank lines at the end before adding our block.
+while result and not result[-1].strip():
+    result.pop()
 
-if inside_block:
-    raise SystemExit(
-        "ERROR: Managed exports block has no matching END marker."
-    )
+result.extend([
+    begin,
+    f"{share_dir} {network}({options})",
+    end,
+])
 
-# Avoid adding an extra blank line to an empty file.
-while updated and not updated[-1].strip():
-    updated.pop()
+new_content = "\n".join(result) + "\n"
+directory = os.path.dirname(exports_file) or "."
 
-if updated:
-    updated.append("")
-
-updated.extend(block)
-
-with open(file_path, "w", encoding="utf-8") as file:
-    file.write("\n".join(updated) + "\n")
+fd, temp_path = tempfile.mkstemp(prefix=".exports.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file.write(new_content)
+    os.chmod(temp_path, 0o644)
+    os.replace(temp_path, exports_file)
+except Exception:
+    if os.path.exists(temp_path):
+        os.unlink(temp_path)
+    raise
 PY
 
 echo
 echo "Current managed export entry:"
-grep -A 1 -B 1 -F "BEGIN managed by 04_nfs_server.sh" "$FILE_PATH"
+sed -n '/# BEGIN managed by 04_nfs_server.sh/,/# END managed by 04_nfs_server.sh/p' "$FILE_PATH"
 
-# -------------------- VALIDATE EXPORT CONFIGURATION -----------
+# ------------------------------------------------------------
+# 12. VALIDATE AND APPLY EXPORTS
+# ------------------------------------------------------------
 
 echo
 echo "Validating NFS export configuration..."
+exportfs -rav
 
-if ! exportfs -rav; then
-    echo "ERROR: Export validation/application failed."
-    echo "Restore the backup if necessary:"
-    echo "  cp -a '$BACKUP_FILE' '$FILE_PATH'"
-    exit 1
-fi
-
-# -------------------- ENABLE AND START NFS SERVER -------------
+# ------------------------------------------------------------
+# 13. ENABLE AND START NFS SERVER
+# ------------------------------------------------------------
 
 echo
 echo "Enabling and starting NFS server..."
 
 systemctl enable --now nfs-server
+systemctl is-active --quiet nfs-server ||
+    error "NFS server service did not become active."
 
-if ! systemctl is-active --quiet nfs-server; then
-    echo "ERROR: NFS server failed to start."
-    systemctl --no-pager --full status nfs-server || true
-    journalctl -u nfs-server -n 50 --no-pager || true
-    exit 1
-fi
-
-# -------------------- CONFIGURE FIREWALL ---------------------
+# ------------------------------------------------------------
+# 14. CONFIGURE FIREWALL IF FIREWALLD IS ACTIVE
+# ------------------------------------------------------------
 
 echo
 echo "Configuring firewall..."
 
-if systemctl is-active --quiet firewalld; then
+if command -v firewall-cmd >/dev/null 2>&1 &&
+   systemctl is-active --quiet firewalld; then
 
-    # NFS service opens the NFS port. mountd and rpc-bind
-    # are also enabled for compatibility with NFSv3 clients.
     firewall-cmd --permanent --add-service=nfs
     firewall-cmd --permanent --add-service=mountd
     firewall-cmd --permanent --add-service=rpc-bind
-
     firewall-cmd --reload
 
     echo "NFS firewall services configured."
     firewall-cmd --list-services
-
 else
-    echo "WARNING: firewalld is not active."
-    echo "Check firewall rules separately if required."
+    echo "firewalld is not active or firewall-cmd is unavailable."
+    echo "Check your firewall rules if remote clients cannot connect."
 fi
 
-# -------------------- DISPLAY EXPORTED SHARES ----------------
+# ------------------------------------------------------------
+# 15. DISPLAY FINAL STATUS
+# ------------------------------------------------------------
 
 echo
 echo "Exported NFS shares:"
 exportfs -v
 
-# -------------------- FINAL VERIFICATION ---------------------
+echo
+print_line
+echo "              NFS SERVER CONFIGURED"
+print_line
 
 echo
-echo "============================================================"
-echo "                 NFS SERVER CONFIGURED"
-echo "============================================================"
-echo
-
 echo "NFS Service Status:"
-systemctl --no-pager --full status nfs-server || true
+systemctl status nfs-server --no-pager --full || true
 
 echo
 echo "NFS Configuration File:"
 echo "  $FILE_PATH"
+
+echo
+echo "Network Interface:"
+echo "  ${SERVER_INTERFACE:-Not detected}"
+
+echo
+echo "NFS Server IP:"
+echo "  $SERVER_IP"
 
 echo
 echo "Shared Directory:"
@@ -321,25 +423,32 @@ echo "  $CLIENT_NETWORK"
 
 echo
 echo "Demo File:"
-echo "  $SHARE_DIR_PATH/$SHARE_DEMO_FILE"
+echo "  $DEMO_FILE_PATH"
 
 echo
-echo "Useful commands:"
+echo "Useful server commands:"
 echo "  systemctl status nfs-server"
 echo "  exportfs -v"
 echo "  exportfs -rav"
-echo "  cat $FILE_PATH"
+echo "  cat /etc/exports"
 echo "  showmount -e localhost"
 
 echo
 echo "Example client mount command:"
-echo "  mount <NFS_SERVER_IP>:$SHARE_DIR_PATH /mnt"
+echo "  mkdir -p /mnt"
+echo "  mount $SERVER_IP:$SHARE_DIR_PATH /mnt"
+echo
+echo "Example client verification:"
+echo "  showmount -e $SERVER_IP"
+echo "  ls -l /mnt"
 
 echo
-echo "NOTE:"
-echo "- Create /mnt on the client before mounting."
-echo "- The client IP must match the exported network."
+echo "NOTES:"
+echo "- Run the mount commands on the NFS CLIENT, not the server."
+echo "- The client must be able to reach $SERVER_IP over the network."
+echo "- Its IP must match the exported network: $CLIENT_NETWORK"
 echo "- File ownership and permissions control write access."
-echo "- For SELinux-related denials, check the audit logs."
-echo "============================================================"
+echo "- root_squash prevents remote root from automatically having local root privileges."
+echo "- If SELinux denies access, inspect the audit logs before changing policies."
+print_line
 
