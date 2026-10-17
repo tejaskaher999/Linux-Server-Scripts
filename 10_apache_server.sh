@@ -85,7 +85,124 @@ valid_document_root() {
        "$path" != "/" ]]
 }
 
-# -------------------- ROOT CHECK ----------------------------
+# -------------------- UPDATE SERVER HOSTS FILE ---------------
+
+update_server_hosts() {
+    local hosts_file="/etc/hosts"
+    local hosts_backup
+    local hosts_temp
+
+    hosts_backup="/etc/hosts.backup.$(date +%Y%m%d_%H%M%S)"
+
+    echo
+    echo "Updating server hostname resolution in /etc/hosts..."
+
+    if [[ ! -f "$hosts_file" ]]; then
+        error "/etc/hosts does not exist."
+        return 1
+    fi
+
+    # Back up the existing hosts file before making changes.
+    if ! cp -a "$hosts_file" "$hosts_backup"; then
+        error "Could not back up /etc/hosts."
+        return 1
+    fi
+
+    hosts_temp=$(mktemp) || {
+        error "Could not create a temporary hosts file."
+        return 1
+    }
+
+    # Remove existing occurrences of the configured website
+    # hostnames while preserving unrelated entries and comments.
+    # Then add the current server IP and website hostnames.
+    if ! awk \
+        -v ip="$SERVER_IP" \
+        -v primary="$SERVER_NAME" \
+        -v configure="$CONFIGURE_VHOST" \
+        -v virtual="$VIRTUAL_HOST" '
+        BEGIN {
+            target[primary] = 1
+
+            if (configure == "yes") {
+                target[virtual] = 1
+            }
+        }
+
+        {
+            if ($0 ~ /^[[:space:]]*#/ ||
+                $0 ~ /^[[:space:]]*$/) {
+                print
+                next
+            }
+
+            n = split($0, fields, /[[:space:]]+/)
+            output = ""
+            comment = ""
+
+            for (i = 1; i <= n; i++) {
+                if (fields[i] == "#") {
+                    for (j = i; j <= n; j++) {
+                        comment = comment \
+                            (comment == "" ? "" : " ") fields[j]
+                    }
+                    break
+                }
+
+                if (fields[i] == "" || target[fields[i]]) {
+                    continue
+                }
+
+                output = output \
+                    (output == "" ? "" : " ") fields[i]
+            }
+
+            if (comment != "") {
+                output = output \
+                    (output == "" ? "" : " ") comment
+            }
+
+            if (output != "") {
+                print output
+            }
+        }
+
+        END {
+            print ip, primary
+
+            if (configure == "yes") {
+                print ip, virtual
+            }
+        }
+        ' "$hosts_file" > "$hosts_temp"; then
+
+        rm -f "$hosts_temp"
+        error "Failed to prepare /etc/hosts."
+        return 1
+    fi
+
+    if ! cat "$hosts_temp" > "$hosts_file"; then
+        rm -f "$hosts_temp"
+        error "Failed to update /etc/hosts."
+        warning "A backup is available at $hosts_backup"
+        return 1
+    fi
+
+    rm -f "$hosts_temp"
+
+    success "Server /etc/hosts updated successfully."
+    echo "Backup of previous hosts file: $hosts_backup"
+
+    echo
+    echo "Current website hostname entries:"
+    grep -E \
+        "^[[:space:]]*${SERVER_IP//./\\.}[[:space:]]" \
+        "$hosts_file"
+
+    return 0
+}
+
+# -------------------- ROOT CHECK -----------------------------
 
 if [[ $EUID -ne 0 ]]; then
     error "Run this script as root."
@@ -93,7 +210,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# -------------------- OS CHECK ------------------------------
+# -------------------- OS CHECK -------------------------------
 
 if [[ ! -f /etc/os-release ]]; then
     error "Cannot identify the operating system."
@@ -108,13 +225,16 @@ if [[ "$ID" != "rocky" && "$ID" != "rhel" &&
     exit 1
 fi
 
-# -------------------- DETECT SERVER IP ----------------------
+# -------------------- DETECT SERVER IP -----------------------
 
 SERVER_IP=$(
     ip -4 route get 1.1.1.1 2>/dev/null |
     awk '{
         for (i=1; i<=NF; i++)
-            if ($i=="src") { print $(i+1); exit }
+            if ($i=="src") {
+                print $(i+1)
+                exit
+            }
     }'
 )
 
@@ -122,7 +242,7 @@ if [[ -z "$SERVER_IP" ]]; then
     SERVER_IP=$(
         ip -o -4 addr show scope global |
         awk 'NR==1 {
-            split($4,a,"/");
+            split($4,a,"/")
             print a[1]
         }'
     )
@@ -132,7 +252,7 @@ SERVER_IP=${SERVER_IP:-127.0.0.1}
 
 HTTP_PORT="$DEFAULT_HTTP_PORT"
 
-# -------------------- HEADER --------------------------------
+# -------------------- HEADER ---------------------------------
 
 clear
 print_line
@@ -148,7 +268,7 @@ echo
 ip -br addr
 echo
 
-# -------------------- PRIMARY WEBSITE -----------------------
+# -------------------- PRIMARY WEBSITE ------------------------
 
 echo
 print_line
@@ -167,7 +287,7 @@ DOCUMENT_ROOT=$(ask_value \
 WELCOME_MESSAGE=$(ask_value \
     "Primary website welcome message" "$DEFAULT_WELCOME_MESSAGE")
 
-# -------------------- VIRTUAL HOST OPTION -------------------
+# -------------------- VIRTUAL HOST OPTION --------------------
 
 echo
 read -r -p \
@@ -203,7 +323,7 @@ else
     VIRTUAL_MESSAGE=""
 fi
 
-# -------------------- VALIDATION ----------------------------
+# -------------------- VALIDATION -----------------------------
 
 if ! valid_hostname "$SERVER_NAME"; then
     error "Invalid primary website hostname: $SERVER_NAME"
@@ -237,7 +357,7 @@ if [[ "$CONFIGURE_VHOST" == "yes" ]]; then
     fi
 fi
 
-# -------------------- CONFIGURATION SUMMARY -----------------
+# -------------------- CONFIGURATION SUMMARY ------------------
 
 echo
 print_line
@@ -266,7 +386,7 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# -------------------- INSTALL APACHE ------------------------
+# -------------------- INSTALL APACHE -------------------------
 
 echo
 echo "[1/8] Installing Apache HTTP Server..."
@@ -278,7 +398,7 @@ fi
 
 rpm -q httpd
 
-# -------------------- BACKUP CONFIGURATION ------------------
+# -------------------- BACKUP CONFIGURATION -------------------
 
 echo
 echo "[2/8] Backing up existing Apache configuration..."
@@ -300,7 +420,7 @@ fi
 
 success "Configuration backup: $BACKUP_DIR"
 
-# -------------------- CREATE PRIMARY WEBSITE ----------------
+# -------------------- CREATE PRIMARY WEBSITE -----------------
 
 echo
 echo "[3/8] Creating primary website..."
@@ -335,7 +455,7 @@ success "Primary website created."
 echo "Document root: $DOCUMENT_ROOT"
 cat "$DOCUMENT_ROOT/index.html"
 
-# -------------------- CREATE VIRTUAL HOST -------------------
+# -------------------- CREATE VIRTUAL HOST --------------------
 
 if [[ "$CONFIGURE_VHOST" == "yes" ]]; then
     echo
@@ -405,7 +525,18 @@ echo
 echo "Configured virtual hosts:"
 httpd -S
 
-# -------------------- START APACHE --------------------------
+# -------------------- AUTOMATIC HOSTS FILE UPDATE ------------
+
+echo
+echo "Adding website hostnames to the server's /etc/hosts..."
+
+if ! update_server_hosts; then
+    error "Could not automatically update server hostname resolution."
+    warning "Check /etc/hosts and the backup information above."
+    exit 1
+fi
+
+# -------------------- START APACHE ---------------------------
 
 echo
 echo "[7/8] Enabling and starting Apache..."
@@ -419,7 +550,7 @@ fi
 systemctl --no-pager --full status httpd
 success "Apache is enabled and running."
 
-# -------------------- FIREWALL ------------------------------
+# -------------------- FIREWALL -------------------------------
 
 echo
 echo "[8/8] Configuring the firewall..."
@@ -441,7 +572,7 @@ else
     warning "firewalld is not active. Firewall was not changed."
 fi
 
-# -------------------- RESTART AND VERIFY --------------------
+# -------------------- RESTART AND VERIFY ---------------------
 
 echo
 echo "Restarting Apache to apply all configuration..."
@@ -462,7 +593,7 @@ echo "Listening HTTP sockets:"
 ss -ltnp | grep -E ":${HTTP_PORT}[[:space:]]" ||
     warning "No listener found on port $HTTP_PORT."
 
-# -------------------- LOCAL WEBSITE TESTS -------------------
+# -------------------- LOCAL WEBSITE TESTS --------------------
 
 echo
 echo "Testing primary website locally..."
@@ -515,7 +646,7 @@ echo "Restart Apache           : systemctl restart httpd"
 echo "Enable at boot           : systemctl enable httpd"
 echo "Allow HTTP in firewall   : firewall-cmd --permanent --add-service=http"
 echo "Reload firewall          : firewall-cmd --reload"
-echo "Test website              : curl http://${SERVER_NAME}/"
+echo "Test website             : curl http://${SERVER_NAME}/"
 
 if [[ "$CONFIGURE_VHOST" == "yes" ]]; then
     echo
@@ -524,6 +655,13 @@ if [[ "$CONFIGURE_VHOST" == "yes" ]]; then
     echo "Virtual access log       : /var/log/httpd/${VIRTUAL_HOST}-access_log"
     echo "Virtual error log        : /var/log/httpd/${VIRTUAL_HOST}-error_log"
 fi
+
+echo
+echo "Server /etc/hosts entries:"
+echo "Updated automatically by this script."
+grep -E \
+    "^[[:space:]]*${SERVER_IP//./\\.}[[:space:]]" \
+    /etc/hosts
 
 echo
 echo "Configuration backup     : $BACKUP_DIR"
@@ -560,9 +698,14 @@ if [[ "$CONFIGURE_VHOST" == "yes" ]]; then
 fi
 
 echo
-echo "If hostname resolution is unavailable, add entries to"
-echo "/etc/hosts on the client machine:"
-printf '   %s %s' "$SERVER_IP" "$SERVER_NAME"
+echo "------------------------------------------------------------"
+echo "CLIENT HOSTS FILE CONFIGURATION"
+echo "------------------------------------------------------------"
+echo
+echo "To open both websites by hostname from the client machine,"
+echo "add the following line to the CLIENT'S /etc/hosts file:"
+echo
+printf '%s %s' "$SERVER_IP" "$SERVER_NAME"
 
 if [[ "$CONFIGURE_VHOST" == "yes" ]]; then
     printf ' %s' "$VIRTUAL_HOST"
@@ -570,14 +713,39 @@ fi
 
 echo
 echo
+echo "On a Rocky Linux client, you can append the entry with:"
+printf 'echo "%s %s' "$SERVER_IP" "$SERVER_NAME"
+
+if [[ "$CONFIGURE_VHOST" == "yes" ]]; then
+    printf ' %s' "$VIRTUAL_HOST"
+fi
+
+echo '" | sudo tee -a /etc/hosts'
+echo
+echo "Then verify hostname resolution on the client:"
+printf '   getent hosts %s\n' "$SERVER_NAME"
+
+if [[ "$CONFIGURE_VHOST" == "yes" ]]; then
+    printf '   getent hosts %s\n' "$VIRTUAL_HOST"
+fi
+
+echo
+echo "Open these URLs in the client browser:"
+printf '   http://%s/\n' "$SERVER_NAME"
+
+if [[ "$CONFIGURE_VHOST" == "yes" ]]; then
+    printf '   http://%s/\n' "$VIRTUAL_HOST"
+fi
+
+echo
 echo "Troubleshooting commands (run on the web server):"
 echo "   httpd -t"
 echo "   httpd -S"
 echo "   systemctl status httpd"
 echo "   journalctl -u httpd -n 30 --no-pager"
 echo "   firewall-cmd --list-all"
+
 echo
 warning "Ensure the client can reach the server IP on TCP port 80."
-warning "Hostname-based curl tests require DNS or a client /etc/hosts entry."
+warning "Client hostname resolution requires DNS or the client /etc/hosts entry."
 print_line
-
