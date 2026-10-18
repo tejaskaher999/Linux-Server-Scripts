@@ -1,300 +1,620 @@
 #!/bin/bash
 
 # ==========================================================
-# Script Name : 10_mariadb_server.sh
-# Purpose     : Install and configure MariaDB Server
+# Script Name : 12_mariadb_server.sh
+# Purpose     : Install and manage MariaDB interactively
 # OS          : Rocky Linux / RHEL
 # ==========================================================
 
-set -Eeuo pipefail
+set -o pipefail
 
-# ---------- Changeable Default Variables ----------
-DEFAULT_DB="skynet"
-DEFAULT_TABLE="student"
-DEFAULT_DB_USER1="alex"
-DEFAULT_DB_USER2="susan"
-DEFAULT_BACKUP="/root/skynet.dump"
-DEFAULT_PORT="3306"
-DEFAULT_CONFIG="/etc/my.cnf.d/99-lab-server.cnf"
+DB_DEFAULT="skynet"
+TABLE_DEFAULT="student"
 
-CONFIG_FILE="$DEFAULT_CONFIG"
-BACKUP_FILE="$DEFAULT_BACKUP"
+# ---------- Colors ----------
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-# ---------- Helper Functions ----------
-log() {
-    echo -e "\n[INFO] $*"
-}
-
-error() {
-    echo -e "\n[ERROR] $*" >&2
-    exit 1
-}
-
-ask() {
-    local prompt="$1"
-    local default="$2"
-    local answer
-    read -r -p "$prompt [$default]: " answer
-    echo "${answer:-$default}"
-}
+info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
+success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+pause()   { read -rp "Press Enter to continue..."; }
 
 # ---------- Root Check ----------
-[[ $EUID -eq 0 ]] || error "Run this script as root."
-
-# ---------- Collect Configuration ----------
-echo "========== MariaDB Server Configuration =========="
-
-DB_NAME=$(ask "Database name" "$DEFAULT_DB")
-TABLE_NAME=$(ask "Table name" "$DEFAULT_TABLE")
-DB_USER1=$(ask "Full-access local user" "$DEFAULT_DB_USER1")
-DB_USER2=$(ask "Read/update local user" "$DEFAULT_DB_USER2")
-DB_PORT=$(ask "MariaDB TCP port" "$DEFAULT_PORT")
-CONFIG_FILE=$(ask "MariaDB configuration file" "$DEFAULT_CONFIG")
-BACKUP_FILE=$(ask "Backup file path" "$DEFAULT_BACKUP")
-
-echo
-echo "Select database access:"
-echo "1. Local access only (recommended for lab default)"
-echo "2. Enable network access on TCP port $DB_PORT"
-read -r -p "Choice [1]: " ACCESS_CHOICE
-ACCESS_CHOICE=${ACCESS_CHOICE:-1}
-
-[[ "$ACCESS_CHOICE" == "1" || "$ACCESS_CHOICE" == "2" ]] ||
-    error "Invalid access choice."
-
-[[ "$DB_PORT" =~ ^[0-9]+$ ]] &&
-    (( DB_PORT >= 1 && DB_PORT <= 65535 )) ||
-    error "Invalid TCP port."
-
-# Validate SQL identifiers to avoid unsafe SQL interpolation.
-for identifier in "$DB_NAME" "$TABLE_NAME" "$DB_USER1" "$DB_USER2"; do
-    [[ "$identifier" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] ||
-        error "Invalid database, table, or username: $identifier"
-done
-
-[[ "$DB_USER1" != "$DB_USER2" ]] ||
-    error "The two database usernames must be different."
-
-[[ "$CONFIG_FILE" == /* ]] ||
-    error "Configuration path must be absolute."
-
-[[ "$BACKUP_FILE" == /* ]] ||
-    error "Backup path must be absolute."
-
-echo
-echo "Database       : $DB_NAME"
-echo "Table          : $TABLE_NAME"
-echo "Full user      : $DB_USER1"
-echo "Read/update user: $DB_USER2"
-echo "TCP port       : $DB_PORT"
-echo "Config file    : $CONFIG_FILE"
-echo "Backup file    : $BACKUP_FILE"
-echo "Network access : $([[ "$ACCESS_CHOICE" == "1" ]] && echo "Disabled" || echo "Enabled")"
-echo
-
-read -r -p "Continue with installation/configuration? (y/N): " CONFIRM
-[[ "$CONFIRM" =~ ^[Yy]$ ]] || error "Cancelled by user."
-
-# ---------- Install Packages ----------
-log "Installing MariaDB server and firewall packages"
-
-dnf install -y mariadb-server firewalld
-
-command -v mariadb >/dev/null 2>&1 ||
-    error "MariaDB client command was not found."
-
-# ---------- Configure MariaDB ----------
-log "Creating MariaDB configuration"
-
-mkdir -p "$(dirname "$CONFIG_FILE")"
-
-if [[ -f "$CONFIG_FILE" ]]; then
-    cp -a "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
-    log "Existing configuration backed up."
+if [[ $EUID -ne 0 ]]; then
+    error "Run this script as root or using sudo."
+    exit 1
 fi
 
-if [[ "$ACCESS_CHOICE" == "1" ]]; then
-    cat > "$CONFIG_FILE" <<EOF
-[mysqld]
-port=$DB_PORT
-skip-networking=1
-EOF
+# ---------- Install MariaDB ----------
+clear
+echo "=========================================="
+echo "       MariaDB Server Installation"
+echo "=========================================="
+
+if ! rpm -q mariadb-server &>/dev/null; then
+    info "Installing MariaDB server..."
+    if ! dnf install -y mariadb-server; then
+        error "MariaDB installation failed."
+        exit 1
+    fi
 else
-    cat > "$CONFIG_FILE" <<EOF
-[mysqld]
-port=$DB_PORT
-skip-networking=0
-bind-address=0.0.0.0
-EOF
+    success "MariaDB server is already installed."
 fi
 
-chmod 644 "$CONFIG_FILE"
+info "Enabling and starting MariaDB..."
+if ! systemctl enable --now mariadb; then
+    error "Could not start MariaDB. Check: journalctl -u mariadb"
+    exit 1
+fi
 
-echo "Configuration written to: $CONFIG_FILE"
-cat "$CONFIG_FILE"
+success "MariaDB service is running."
 
-# ---------- Start Service ----------
-log "Enabling and starting MariaDB"
+# ---------- Database Authentication ----------
+ROOT_PASSWORD=""
 
-systemctl enable --now mariadb
-systemctl restart mariadb
+if mariadb -u root -Nse "SELECT 1" &>/dev/null; then
+    info "Root access through local socket is working."
+else
+    echo
+    read -rsp "Enter MariaDB root password: " ROOT_PASSWORD
+    echo
 
-systemctl is-active --quiet mariadb ||
-    error "MariaDB failed to start. Check: journalctl -u mariadb"
-
-# ---------- Secure Installation ----------
-echo
-read -r -p "Run mariadb-secure-installation interactively? (y/N): " SECURE_CHOICE
-
-if [[ "$SECURE_CHOICE" =~ ^[Yy]$ ]]; then
-    if command -v mariadb-secure-installation >/dev/null 2>&1; then
-        mariadb-secure-installation
-    else
-        echo "mariadb-secure-installation command not found; skipping."
+    if ! MYSQL_PWD="$ROOT_PASSWORD" mariadb -u root -Nse "SELECT 1" &>/dev/null; then
+        error "MariaDB root login failed."
+        unset ROOT_PASSWORD
+        exit 1
     fi
 fi
 
-# ---------- Root Database Connection ----------
-# On typical Rocky Linux installations, root can authenticate
-# through the local Unix socket. This script does not assume
-# that MariaDB root has a password.
-DB_CLIENT=(mariadb)
+# Run MariaDB commands using the detected authentication method.
+run_sql() {
+    if [[ -n "$ROOT_PASSWORD" ]]; then
+        MYSQL_PWD="$ROOT_PASSWORD" mariadb -u root "$@"
+    else
+        mariadb -u root "$@"
+    fi
+}
 
-if ! "${DB_CLIENT[@]}" -e "SELECT 1;" >/dev/null 2>&1; then
+run_dump() {
+    if [[ -n "$ROOT_PASSWORD" ]]; then
+        MYSQL_PWD="$ROOT_PASSWORD" mariadb-dump -u root "$@"
+    else
+        mariadb-dump -u root "$@"
+    fi
+}
+
+# ---------- Validation ----------
+valid_name() {
+    [[ "$1" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]
+}
+
+ask_database() {
+    read -rp "Enter database name [$DB_DEFAULT]: " DB
+    DB=${DB:-$DB_DEFAULT}
+
+    if ! valid_name "$DB"; then
+        error "Invalid database name."
+        return 1
+    fi
+}
+
+ask_table() {
+    read -rp "Enter table name [$TABLE_DEFAULT]: " TABLE
+    TABLE=${TABLE:-$TABLE_DEFAULT}
+
+    if ! valid_name "$TABLE"; then
+        error "Invalid table name."
+        return 1
+    fi
+}
+
+database_exists() {
+    [[ "$(run_sql -Nse \
+        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA
+         WHERE SCHEMA_NAME='$DB';" 2>/dev/null)" == "$DB" ]]
+}
+
+table_exists() {
+    [[ "$(run_sql -Nse \
+        "SELECT TABLE_NAME FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA='$DB' AND TABLE_NAME='$TABLE';" 2>/dev/null)" == "$TABLE" ]]
+}
+
+require_database() {
+    ask_database || return 1
+
+    if ! database_exists; then
+        error "Database '$DB' does not exist. Create it first."
+        return 1
+    fi
+}
+
+require_table() {
+    require_database || return 1
+    ask_table || return 1
+
+    if ! table_exists; then
+        error "Table '$TABLE' does not exist in '$DB'."
+        return 1
+    fi
+}
+
+# Escape apostrophes in user-entered string values.
+sql_escape() {
+    local value=$1
+    value=${value//\'/\'\'}
+    printf '%s' "$value"
+}
+
+# ---------- Menu Operations ----------
+
+create_database() {
     echo
-    echo "Local socket login did not work."
-    echo "If root uses password authentication, enter the password below."
-    read -r -s -p "MariaDB root password: " ROOT_PASSWORD
+    read -rp "New database name: " DB
+
+    if ! valid_name "$DB"; then
+        error "Use letters, numbers and underscores; start with a letter or underscore."
+        return
+    fi
+
+    if database_exists; then
+        info "Database '$DB' already exists."
+    else
+        if run_sql -e "CREATE DATABASE \`$DB\`;"; then
+            success "Database '$DB' created."
+        else
+            error "Could not create database."
+            return
+        fi
+    fi
+
+    echo
+    run_sql -e "SHOW DATABASES LIKE '$DB';"
+}
+
+display_databases() {
+    echo
+    info "Available databases:"
+    run_sql -e "SHOW DATABASES;"
+}
+
+create_table() {
+    require_database || return
+
+    echo
+    read -rp "New table name: " TABLE
+
+    if ! valid_name "$TABLE"; then
+        error "Invalid table name."
+        return
+    fi
+
+    if table_exists; then
+        error "Table '$TABLE' already exists."
+        return
+    fi
+
+    echo
+    echo "Supported column types:"
+    echo "1. INT"
+    echo "2. VARCHAR"
+    echo "3. DATE"
+    echo "4. DECIMAL"
+    echo "5. TEXT"
     echo
 
-    MYSQL_PWD="$ROOT_PASSWORD" mariadb -u root -e "SELECT 1;" >/dev/null 2>&1 ||
-        error "Cannot connect as MariaDB root. Check authentication."
+    read -rp "How many columns? " COUNT
 
-    DB_CLIENT=(mariadb -u root -p"$ROOT_PASSWORD")
-    unset ROOT_PASSWORD
-fi
+    if ! [[ "$COUNT" =~ ^[1-9][0-9]*$ ]] || (( COUNT > 30 )); then
+        error "Enter a number between 1 and 30."
+        return
+    fi
 
-# ---------- Create Database and Table ----------
-log "Creating database and student table"
+    local definitions=""
+    local COL TYPE LENGTH SQLTYPE CHOICE
+    local i
 
-"${DB_CLIENT[@]}" <<SQL
-CREATE DATABASE IF NOT EXISTS \`$DB_NAME\`;
-USE \`$DB_NAME\`;
+    for ((i=1; i<=COUNT; i++)); do
+        echo
+        echo "--- Column $i ---"
+        read -rp "Column name: " COL
 
-CREATE TABLE IF NOT EXISTS \`$TABLE_NAME\` (
-    ID INT PRIMARY KEY,
-    NAME VARCHAR(50),
-    EMAIL VARCHAR(100),
-    Address VARCHAR(100)
-);
+        if ! valid_name "$COL"; then
+            error "Invalid column name."
+            return
+        fi
 
-INSERT INTO \`$TABLE_NAME\` (ID, NAME, EMAIL, Address)
-VALUES
-    (1, 'kishor', 'k@gmail.com', 'nashik'),
-    (2, 'radhika', 'r@gmail.com', 'pune')
-ON DUPLICATE KEY UPDATE
-    NAME = VALUES(NAME),
-    EMAIL = VALUES(EMAIL),
-    Address = VALUES(Address);
+        if [[ "$definitions" == *"\`$COL\`"* ]]; then
+            error "Duplicate column name."
+            return
+        fi
 
-SHOW DATABASES;
-SHOW TABLES;
-DESCRIBE \`$TABLE_NAME\`;
-SELECT * FROM \`$TABLE_NAME\`;
-SQL
+        echo "1) INT  2) VARCHAR  3) DATE  4) DECIMAL  5) TEXT"
+        read -rp "Choose type [1-5]: " CHOICE
 
-# ---------- Create Local Database Users ----------
-log "Creating local database users"
+        case "$CHOICE" in
+            1) SQLTYPE="INT" ;;
+            2)
+                read -rp "VARCHAR length [100]: " LENGTH
+                LENGTH=${LENGTH:-100}
+                if ! [[ "$LENGTH" =~ ^[1-9][0-9]*$ ]] || (( LENGTH > 4000 )); then
+                    error "Invalid VARCHAR length."
+                    return
+                fi
+                SQLTYPE="VARCHAR($LENGTH)"
+                ;;
+            3) SQLTYPE="DATE" ;;
+            4) SQLTYPE="DECIMAL(10,2)" ;;
+            5) SQLTYPE="TEXT" ;;
+            *)
+                error "Invalid type."
+                return
+                ;;
+        esac
 
-echo
-echo "Enter passwords for the database users."
-echo "Allowed characters: letters, digits, underscore, ! @ # . -"
-echo "Use strong passwords; do not use the example password 'redhat'."
+        if (( i == 1 )); then
+            definitions="\`$COL\` $SQLTYPE NOT NULL PRIMARY KEY"
+        else
+            definitions+=", \`$COL\` $SQLTYPE"
+        fi
+    done
 
-read -r -s -p "Password for $DB_USER1: " PASS1
-echo
-read -r -s -p "Password for $DB_USER2: " PASS2
-echo
+    if run_sql -e "CREATE TABLE \`$DB\`.\`$TABLE\` ($definitions);"; then
+        success "Table '$TABLE' created in '$DB'."
+        echo
+        info "Table structure:"
+        run_sql -e "DESCRIBE \`$DB\`.\`$TABLE\`;"
+    else
+        error "Table creation failed."
+    fi
+}
 
-[[ "$PASS1" =~ ^[a-zA-Z0-9_!@#.-]+$ ]] ||
-    error "Password for $DB_USER1 contains unsupported characters."
+display_tables() {
+    require_database || return
 
-[[ "$PASS2" =~ ^[a-zA-Z0-9_!@#.-]+$ ]] ||
-    error "Password for $DB_USER2 contains unsupported characters."
+    echo
+    info "Tables in database '$DB':"
+    run_sql -e "SHOW TABLES FROM \`$DB\`;"
+}
 
-[[ -n "$PASS1" && -n "$PASS2" ]] ||
-    error "Passwords cannot be empty."
+display_structure() {
+    require_table || return
 
-"${DB_CLIENT[@]}" <<SQL
-CREATE USER IF NOT EXISTS '$DB_USER1'@'localhost' IDENTIFIED BY '$PASS1';
-CREATE USER IF NOT EXISTS '$DB_USER2'@'localhost' IDENTIFIED BY '$PASS2';
+    echo
+    info "Structure of '$DB.$TABLE':"
+    run_sql -e "DESCRIBE \`$DB\`.\`$TABLE\`;"
+}
 
-GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER1'@'localhost';
-GRANT SELECT, UPDATE ON \`$DB_NAME\`.* TO '$DB_USER2'@'localhost';
+insert_data() {
+    require_table || return
 
-SHOW GRANTS FOR '$DB_USER1'@'localhost';
-SHOW GRANTS FOR '$DB_USER2'@'localhost';
-SQL
+    local COL VALUE SQL_COLUMNS="" SQL_VALUES=""
+    local -a COLUMNS=()
 
-unset PASS1 PASS2
+    while IFS= read -r COL; do
+        [[ -n "$COL" ]] && COLUMNS+=("$COL")
+    done < <(run_sql -Nse \
+        "SHOW COLUMNS FROM \`$DB\`.\`$TABLE\`;" 2>/dev/null | cut -f1)
 
-# ---------- Firewall ----------
-if [[ "$ACCESS_CHOICE" == "2" ]]; then
-    log "Enabling firewall and opening MariaDB TCP port"
+    if (( ${#COLUMNS[@]} == 0 )); then
+        error "Could not read table columns."
+        return
+    fi
 
-    systemctl enable --now firewalld
+    echo
+    echo "Enter values for one record."
+    echo "For DATE columns, use YYYY-MM-DD."
+    echo "For numeric columns, enter numbers."
+    echo
 
-    firewall-cmd --permanent --add-port="${DB_PORT}/tcp"
-    firewall-cmd --reload
+    for COL in "${COLUMNS[@]}"; do
+        read -rp "$COL: " VALUE
+        VALUE=$(sql_escape "$VALUE")
 
-    echo "WARNING: TCP port ${DB_PORT} is open in the active firewall zone."
-    echo "For production, restrict access to trusted client IP addresses."
-else
-    log "Local-only mode selected; no MariaDB firewall port opened."
-fi
+        SQL_COLUMNS+="${SQL_COLUMNS:+, }\`$COL\`"
+        SQL_VALUES+="${SQL_VALUES:+, }'$VALUE'"
+    done
 
-# ---------- Verification ----------
-log "Checking MariaDB service"
-systemctl --no-pager --full status mariadb
+    if run_sql -e \
+        "INSERT INTO \`$DB\`.\`$TABLE\` ($SQL_COLUMNS) VALUES ($SQL_VALUES);"; then
+        success "Record inserted."
+        echo
+        info "Current table data:"
+        run_sql -e "SELECT * FROM \`$DB\`.\`$TABLE\`;"
+    else
+        error "Insert failed. Check the values and column constraints."
+    fi
+}
 
-log "Checking MariaDB configuration"
-echo "Configuration file: $CONFIG_FILE"
+insert_dummy_data() {
+    require_database || return
+    TABLE="student"
 
-log "Checking database and sample data"
-"${DB_CLIENT[@]}" -e "
-SHOW DATABASES LIKE '$DB_NAME';
-USE \`$DB_NAME\`;
-SHOW TABLES;
-SELECT * FROM \`$TABLE_NAME\`;
-"
+    if ! table_exists; then
+        echo
+        info "Creating the standard student table..."
+        run_sql -e "
+            CREATE TABLE \`$DB\`.student (
+                ID INT PRIMARY KEY,
+                NAME VARCHAR(50),
+                EMAIL VARCHAR(100),
+                Address VARCHAR(100)
+            );" || return
+    fi
 
-if [[ "$ACCESS_CHOICE" == "2" ]]; then
-    log "Checking TCP listener"
-    ss -ltnp | grep -E ":${DB_PORT}[[:space:]]" ||
-        echo "WARNING: No listener detected on port $DB_PORT."
-fi
+    echo
+    info "Adding sample student records..."
 
-echo
-echo "=================================================="
-echo " MariaDB Server setup completed"
-echo "=================================================="
-echo "Database : $DB_NAME"
-echo "Table    : $TABLE_NAME"
-echo "Service  : mariadb"
-echo "Port     : $DB_PORT"
-echo "Config   : $CONFIG_FILE"
-echo "Backup   : $BACKUP_FILE"
-echo
-echo "To connect locally:"
-echo "  mariadb"
-echo
-echo "To create a backup:"
-echo "  mariadb-dump $DB_NAME > '$BACKUP_FILE'"
-echo
-echo "To restore a backup:"
-echo "  mariadb $DB_NAME < '$BACKUP_FILE'"
-echo
-echo "Service logs:"
-echo "  journalctl -u mariadb"
-echo "=================================================="
+    if run_sql -e "
+        INSERT INTO \`$DB\`.student (ID, NAME, EMAIL, Address)
+        VALUES
+          (1, 'Kishor', 'k@gmail.com', 'Nashik'),
+          (2, 'Radhika', 'r@gmail.com', 'Pune')
+        ON DUPLICATE KEY UPDATE
+          NAME=VALUES(NAME),
+          EMAIL=VALUES(EMAIL),
+          Address=VALUES(Address);"; then
+        success "Dummy data inserted or refreshed."
+        echo
+        run_sql -e "SELECT * FROM \`$DB\`.student;"
+    else
+        error "Could not insert sample data."
+    fi
+}
+
+display_records() {
+    require_table || return
+
+    echo
+    info "Records in '$DB.$TABLE':"
+    run_sql -e "SELECT * FROM \`$DB\`.\`$TABLE\`;"
+}
+
+update_record() {
+    require_table || return
+
+    local COL VALUE KEYCOL KEYVAL
+
+    echo
+    run_sql -e "DESCRIBE \`$DB\`.\`$TABLE\`;"
+    read -rp "Column to update: " COL
+    read -rp "New value: " VALUE
+    read -rp "Condition column (usually primary key): " KEYCOL
+    read -rp "Condition value: " KEYVAL
+
+    if ! valid_name "$COL" || ! valid_name "$KEYCOL"; then
+        error "Invalid column name."
+        return
+    fi
+
+    VALUE=$(sql_escape "$VALUE")
+    KEYVAL=$(sql_escape "$KEYVAL")
+
+    if run_sql -e "
+        UPDATE \`$DB\`.\`$TABLE\`
+        SET \`$COL\`='$VALUE'
+        WHERE \`$KEYCOL\`='$KEYVAL';"; then
+        success "Update command completed."
+        run_sql -e "SELECT * FROM \`$DB\`.\`$TABLE\`;"
+    else
+        error "Update failed."
+    fi
+}
+
+delete_record() {
+    require_table || return
+
+    local KEYCOL KEYVAL CONFIRM
+
+    echo
+    run_sql -e "SELECT * FROM \`$DB\`.\`$TABLE\`;"
+    read -rp "Condition column (usually primary key): " KEYCOL
+    read -rp "Condition value: " KEYVAL
+
+    if ! valid_name "$KEYCOL"; then
+        error "Invalid column name."
+        return
+    fi
+
+    KEYVAL=$(sql_escape "$KEYVAL")
+
+    echo
+    echo "Matching rows will be deleted."
+    read -rp "Continue? (y/N): " CONFIRM
+
+    [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]] || {
+        info "Delete cancelled."
+        return
+    }
+
+    if run_sql -e \
+        "DELETE FROM \`$DB\`.\`$TABLE\` WHERE \`$KEYCOL\`='$KEYVAL';"; then
+        success "Delete command completed."
+        run_sql -e "SELECT * FROM \`$DB\`.\`$TABLE\`;"
+    else
+        error "Delete failed."
+    fi
+}
+
+add_column() {
+    require_table || return
+
+    local COL CHOICE LENGTH SQLTYPE
+
+    read -rp "New column name: " COL
+
+    if ! valid_name "$COL"; then
+        error "Invalid column name."
+        return
+    fi
+
+    echo "1) INT  2) VARCHAR  3) DATE  4) DECIMAL  5) TEXT"
+    read -rp "Choose type [1-5]: " CHOICE
+
+    case "$CHOICE" in
+        1) SQLTYPE="INT" ;;
+        2)
+            read -rp "VARCHAR length [100]: " LENGTH
+            LENGTH=${LENGTH:-100}
+            if ! [[ "$LENGTH" =~ ^[1-9][0-9]*$ ]] || (( LENGTH > 4000 )); then
+                error "Invalid length."
+                return
+            fi
+            SQLTYPE="VARCHAR($LENGTH)"
+            ;;
+        3) SQLTYPE="DATE" ;;
+        4) SQLTYPE="DECIMAL(10,2)" ;;
+        5) SQLTYPE="TEXT" ;;
+        *) error "Invalid type."; return ;;
+    esac
+
+    if run_sql -e \
+        "ALTER TABLE \`$DB\`.\`$TABLE\` ADD COLUMN \`$COL\` $SQLTYPE;"; then
+        success "Column added."
+        run_sql -e "DESCRIBE \`$DB\`.\`$TABLE\`;"
+    else
+        error "Could not add column."
+    fi
+}
+
+drop_column() {
+    require_table || return
+
+    local COL CONFIRM
+    run_sql -e "DESCRIBE \`$DB\`.\`$TABLE\`;"
+    read -rp "Column to remove: " COL
+
+    if ! valid_name "$COL"; then
+        error "Invalid column name."
+        return
+    fi
+
+    echo
+    error "This permanently removes the column and its data."
+    read -rp "Confirm removal? (y/N): " CONFIRM
+
+    [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]] || return
+
+    if run_sql -e \
+        "ALTER TABLE \`$DB\`.\`$TABLE\` DROP COLUMN \`$COL\`;"; then
+        success "Column removed."
+        run_sql -e "DESCRIBE \`$DB\`.\`$TABLE\`;"
+    else
+        error "Could not remove column."
+    fi
+}
+
+backup_database() {
+    require_database || return
+
+    local FILE
+    read -rp "Backup path [/root/$DB.sql]: " FILE
+    FILE=${FILE:-/root/$DB.sql}
+
+    if [[ -e "$FILE" ]]; then
+        error "File already exists: $FILE"
+        read -rp "Overwrite it? (y/N): " CONFIRM
+        [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]] || return
+    fi
+
+    if run_dump --databases "$DB" > "$FILE"; then
+        chmod 600 "$FILE"
+        success "Backup saved to '$FILE'."
+        ls -lh "$FILE"
+    else
+        error "Backup failed."
+        rm -f "$FILE"
+    fi
+}
+
+restore_database() {
+    local FILE
+    read -rp "Full path to SQL backup: " FILE
+
+    if [[ ! -f "$FILE" || ! -r "$FILE" ]]; then
+        error "Backup file does not exist or is unreadable."
+        return
+    fi
+
+    echo
+    error "Restoring executes SQL from this file and may overwrite data."
+    read -rp "Continue? (y/N): " CONFIRM
+    [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]] || return
+
+    if run_sql < "$FILE"; then
+        success "Restore command completed."
+    else
+        error "Restore failed. Check the SQL file and MariaDB output."
+    fi
+}
+
+service_status() {
+    echo
+    systemctl status mariadb --no-pager
+    echo
+    info "Listening TCP ports:"
+    ss -lntp | grep -E '(:3306[[:space:]]|:3306$)' ||
+        echo "No TCP listener on port 3306 (local socket access may still work)."
+}
+
+# ---------- Main Menu ----------
+while true; do
+    clear
+    echo "=================================================="
+    echo "          MariaDB Database Management"
+    echo "=================================================="
+    echo " Service : MariaDB"
+    echo " Status  : $(systemctl is-active mariadb)"
+    echo "=================================================="
+    echo " 1.  Create database"
+    echo " 2.  Display all databases"
+    echo " 3.  Create table with custom columns"
+    echo " 4.  Display tables in a database"
+    echo " 5.  Display table structure"
+    echo " 6.  Insert one record into a table"
+    echo " 7.  Insert dummy student data"
+    echo " 8.  Display table records"
+    echo " 9.  Update a record"
+    echo "10.  Delete a record"
+    echo "11.  Add a column"
+    echo "12.  Drop a column"
+    echo "13.  Back up a database"
+    echo "14.  Restore a database backup"
+    echo "15.  MariaDB service status"
+    echo " 0.  Exit"
+    echo "=================================================="
+
+    read -rp "Enter your choice: " CHOICE
+
+    case "$CHOICE" in
+        1)  create_database; pause ;;
+        2)  display_databases; pause ;;
+        3)  create_table; pause ;;
+        4)  display_tables; pause ;;
+        5)  display_structure; pause ;;
+        6)  insert_data; pause ;;
+        7)  insert_dummy_data; pause ;;
+        8)  display_records; pause ;;
+        9)  update_record; pause ;;
+        10) delete_record; pause ;;
+        11) add_column; pause ;;
+        12) drop_column; pause ;;
+        13) backup_database; pause ;;
+        14) restore_database; pause ;;
+        15) service_status; pause ;;
+        0)
+            success "Exiting MariaDB management menu."
+            unset ROOT_PASSWORD
+            exit 0
+            ;;
+        *)
+            error "Invalid choice. Select an option from the menu."
+            sleep 2
+            ;;
+    esac
+done
 
