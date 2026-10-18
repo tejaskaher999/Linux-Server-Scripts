@@ -663,4 +663,3 @@ echo "============================================================"
 echo
 echo "IMPORTANT: Keep your current session open until you verify"
 echo "that a new SSH connection works on the selected port."
-
